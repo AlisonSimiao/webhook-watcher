@@ -40,7 +40,8 @@ func generateEventID(binlogFile string, logPos uint32, rowIndex int, event Event
 
 func (p *Producer) HandleEvent(binlogFile string, binlogPos uint32, ev *replication.BinlogEvent) error {
 	switch ev.Header.EventType {
-	case replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2:
+	case replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2,
+		replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1:
 		fmt.Printf("Evento recebido: %s\n", ev.Header.EventType.String())
 		rowsEvent, ok := ev.Event.(*replication.RowsEvent)
 
@@ -50,6 +51,7 @@ func (p *Producer) HandleEvent(binlogFile string, binlogPos uint32, ev *replicat
 
 		rowIndex := 0
 		for i := 0; i < len(rowsEvent.Rows); i += 2 {
+			rowIndex++
 			newRow := rowsEvent.Rows[i+1]
 			resourceID, ok := newRow[0].(int32)
 			if !ok {
@@ -68,7 +70,6 @@ func (p *Producer) HandleEvent(binlogFile string, binlogPos uint32, ev *replicat
 			event.ID = generateEventID(binlogFile, binlogPos, rowIndex, event)
 
 			fmt.Println(event)
-
 		}
 	default:
 		fmt.Printf("Evento recebido: %s\n", ev.Header.EventType.String())

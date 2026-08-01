@@ -34,8 +34,17 @@ func (b *BinlogWatcher) Start() error {
 		return fmt.Errorf("erro ao consultar SHOW MASTER STATUS: %w", err)
 	}
 
-	binlogFile, _ := res.GetString(0, 0)
-	binlogPos, _ := res.GetUint(0, 1)
+	if res.RowNumber() == 0 {
+		return fmt.Errorf("SHOW MASTER STATUS retornou nenhuma linha: binlog provavelmente desabilitado")
+	}
+	binlogFile, err := res.GetString(0, 0)
+	if err != nil {
+		return fmt.Errorf("erro ao ler arquivo do binlog: %w", err)
+	}
+	binlogPos, err := res.GetUint(0, 1)
+	if err != nil {
+		return fmt.Errorf("erro ao ler posição do binlog: %w", err)
+	}
 	b.cfg.SetBinlogData(binlogFile, uint32(binlogPos))
 
 	pos := mysql.Position{
@@ -77,8 +86,16 @@ func (b *BinlogWatcher) Start() error {
 		}
 
 		if ev != nil {
+			// Evento de rotação: atualiza nome e posição do binlog para o próximo arquivo
+			if rotate, ok := ev.Event.(*replication.RotateEvent); ok {
+				pos.Name = string(rotate.NextLogName)
+				pos.Pos = uint32(rotate.Position)
+				fmt.Printf("Binlog rotacionado para %s:%d\n", pos.Name, pos.Pos)
+				continue
+			}
+
 			producer.HandleEvent(pos.Name, pos.Pos, ev)
+			pos.Pos = ev.Header.LogPos
 		}
-		pos.Pos = ev.Header.LogPos
 	}
 }
