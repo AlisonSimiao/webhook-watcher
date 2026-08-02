@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"webhook-watcher/producer"
 
 	"github.com/go-mysql-org/go-mysql/client"
+	_ "github.com/go-mysql-org/go-mysql/driver"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 )
@@ -74,7 +76,16 @@ func (b *BinlogWatcher) Start() error {
 
 	b.log.Info("Conectado e escutando eventos com sucesso")
 
-	prod := producer.NewProducer(b.log)
+	// Abre conexão sql.DB com o banco MariaDB para consultas de enriquecimento
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/", b.cfg.User, b.cfg.Password, b.cfg.Host, b.cfg.Port)
+	mariadb, errDB := sql.Open("mysql", dsn)
+	if errDB != nil {
+		b.log.Warn("Não foi possível abrir conexão sql.DB para enriquecimento", "error", errDB)
+	} else {
+		defer mariadb.Close()
+	}
+
+	prod := producer.NewProducer(b.log, mariadb)
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

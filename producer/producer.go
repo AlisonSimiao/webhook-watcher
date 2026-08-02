@@ -2,6 +2,7 @@ package producer
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -43,10 +44,17 @@ type EventStrategy interface {
 type Producer struct {
 	strategies map[replication.EventType]EventStrategy
 	log        *slog.Logger
+	db         *sql.DB
 }
 
-func NewProducer(logger *slog.Logger) *Producer {
-	update := &UpdateRowsStrategy{RowsStrategy: RowsStrategy{log: logger}}
+func NewProducer(logger *slog.Logger, db *sql.DB) *Producer {
+	update := &UpdateRowsStrategy{
+		RowsStrategy: RowsStrategy{
+			log:        logger,
+			db:         db,
+			processors: defaultProcessors(),
+		},
+	}
 	return &Producer{
 		strategies: map[replication.EventType]EventStrategy{
 			replication.UPDATE_ROWS_EVENTv1:                     update,
@@ -54,6 +62,7 @@ func NewProducer(logger *slog.Logger) *Producer {
 			replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1: update,
 		},
 		log: logger,
+		db:  db,
 	}
 }
 

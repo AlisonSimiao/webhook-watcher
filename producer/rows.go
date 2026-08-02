@@ -1,15 +1,27 @@
 package producer
 
 import (
+	"database/sql"
 	"fmt"
 	"log/slog"
 
 	"github.com/go-mysql-org/go-mysql/replication"
+
+	"webhook-watcher/tables"
+	"webhook-watcher/tables/pedido"
 )
 
 // RowsStrategy contém a lógica comum a eventos ROWS (insert/update/delete).
 type RowsStrategy struct {
-	log *slog.Logger
+	log        *slog.Logger
+	db         *sql.DB
+	processors []tables.TableProcessor
+}
+
+func defaultProcessors() []tables.TableProcessor {
+	return []tables.TableProcessor{
+		pedido.NewPedidoProcessor(),
+	}
 }
 
 // eachRow itera sobre as linhas de um RowsEvent. stride e newOffset dependem do
@@ -28,6 +40,28 @@ func (r *RowsStrategy) eachRow(ctx *EventContext, stride, newOffset int, visit f
 		}
 	}
 	return nil
+}
+
+// dispatchTable verifica se há um TableProcessor registrado para a tabela.
+func (r *RowsStrategy) dispatchTable(schema, tableName, action string, newRow, oldRow []interface{}) (interface{}, bool, error) {
+	tCtx := &tables.TableContext{
+		TableName: tableName,
+		Schema:    schema,
+		Action:    action,
+		NewRow:    newRow,
+		OldRow:    oldRow,
+		DB:        r.db,
+		Log:       r.log,
+	}
+
+	for _, proc := range r.processors {
+		if proc.Supports(tableName) {
+			res, err := proc.Process(tCtx)
+			return res, true, err
+		}
+	}
+
+	return nil, false, nil
 }
 
 // buildEvent monta o Event a partir da nova linha, incluindo o ID único.
