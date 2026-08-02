@@ -8,8 +8,9 @@ COPY go.sum ./
 
 RUN go mod download
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o webhook-watcher main.go
+COPY . .
 
+RUN CGO_ENABLED=0 GOOS=linux go build -o webhook-watcher .
 
 # APLICAÇÃO FINAL
 FROM alpine:3.23
@@ -17,10 +18,5 @@ FROM alpine:3.23
 WORKDIR /app
 
 COPY --from=builder /app/webhook-watcher .
-
-# para o sqlite
-VOLUME /app/data
-
-EXPOSE 3000
 
 CMD ["./webhook-watcher"]
