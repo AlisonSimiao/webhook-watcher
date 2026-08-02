@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"webhook-watcher/config"
+	"webhook-watcher/producer"
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -71,7 +72,7 @@ func (b *BinlogWatcher) Start() error {
 
 	fmt.Println("Conectado e escutando eventos com sucesso!")
 
-	producer := NewProducer()
+	prod := producer.NewProducer()
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -94,7 +95,7 @@ func (b *BinlogWatcher) Start() error {
 				continue
 			}
 
-			producer.HandleEvent(pos.Name, pos.Pos, ev)
+			prod.HandleEvent(pos.Name, pos.Pos, ev)
 			pos.Pos = ev.Header.LogPos
 		}
 	}
