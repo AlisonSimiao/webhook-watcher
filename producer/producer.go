@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 )
@@ -41,23 +42,25 @@ type EventStrategy interface {
 // Producer despacha cada tipo de evento para a estratégia registrada.
 type Producer struct {
 	strategies map[replication.EventType]EventStrategy
+	log        *slog.Logger
 }
 
-func NewProducer() *Producer {
-	update := &UpdateRowsStrategy{}
+func NewProducer(logger *slog.Logger) *Producer {
+	update := &UpdateRowsStrategy{RowsStrategy: RowsStrategy{log: logger}}
 	return &Producer{
 		strategies: map[replication.EventType]EventStrategy{
 			replication.UPDATE_ROWS_EVENTv1:                     update,
 			replication.UPDATE_ROWS_EVENTv2:                     update,
 			replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1: update,
 		},
+		log: logger,
 	}
 }
 
 func (p *Producer) HandleEvent(binlogFile string, binlogPos uint32, ev *replication.BinlogEvent) error {
 	strategy, ok := p.strategies[ev.Header.EventType]
 	if !ok {
-		fmt.Printf("Evento sem estratégia registrada: %s\n", ev.Header.EventType.String())
+		p.log.Warn("Evento sem estratégia registrada", "tipo", ev.Header.EventType.String())
 		return nil
 	}
 	return strategy.Handle(&EventContext{

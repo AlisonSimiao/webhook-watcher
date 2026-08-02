@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"webhook-watcher/config"
@@ -14,11 +15,12 @@ import (
 )
 
 type BinlogWatcher struct {
-	cfg config.Config
+	cfg config.ServerConfig
+	log *slog.Logger
 }
 
-func newBinlogWatcher(cfg config.Config) *BinlogWatcher {
-	return &BinlogWatcher{cfg: cfg}
+func newBinlogWatcher(cfg config.ServerConfig, logger *slog.Logger) *BinlogWatcher {
+	return &BinlogWatcher{cfg: cfg, log: logger.With("server_id", cfg.ServerID)}
 }
 
 func (b *BinlogWatcher) Start() error {
@@ -53,10 +55,10 @@ func (b *BinlogWatcher) Start() error {
 		Pos:  uint32(binlogPos),
 	}
 
-	fmt.Printf("Posição atual do binlog: %s:%d\n", pos.Name, pos.Pos)
+	b.log.Info("Posição atual do binlog", "binlog_file", pos.Name, "binlog_pos", pos.Pos)
 
 	syncerCfg := replication.BinlogSyncerConfig{
-		ServerID: b.cfg.ServerID,
+		ServerID: b.cfg.ReplicaID,
 		Flavor:   b.cfg.Flavor,
 		Host:     b.cfg.Host,
 		Port:     b.cfg.Port,
@@ -70,9 +72,9 @@ func (b *BinlogWatcher) Start() error {
 		return fmt.Errorf("erro ao iniciar streamer sync: %w", err)
 	}
 
-	fmt.Println("Conectado e escutando eventos com sucesso!")
+	b.log.Info("Conectado e escutando eventos com sucesso")
 
-	prod := producer.NewProducer()
+	prod := producer.NewProducer(b.log)
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -91,7 +93,7 @@ func (b *BinlogWatcher) Start() error {
 			if rotate, ok := ev.Event.(*replication.RotateEvent); ok {
 				pos.Name = string(rotate.NextLogName)
 				pos.Pos = uint32(rotate.Position)
-				fmt.Printf("Binlog rotacionado para %s:%d\n", pos.Name, pos.Pos)
+				b.log.Info("Binlog rotacionado", "binlog_file", pos.Name, "binlog_pos", pos.Pos)
 				continue
 			}
 

@@ -2,12 +2,15 @@ package producer
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 )
 
 // RowsStrategy contém a lógica comum a eventos ROWS (insert/update/delete).
-type RowsStrategy struct{}
+type RowsStrategy struct {
+	log *slog.Logger
+}
 
 // eachRow itera sobre as linhas de um RowsEvent. stride e newOffset dependem do
 // formato da ação: UPDATE chega em pares old/new (stride 2, nova linha em i+1);
@@ -31,8 +34,10 @@ func (r *RowsStrategy) eachRow(ctx *EventContext, stride, newOffset int, visit f
 func (r *RowsStrategy) buildEvent(ctx *EventContext, rowsEvent *replication.RowsEvent, action Action, rowIndex int, newRow []interface{}) (Event, bool) {
 	resourceID, ok := newRow[0].(int32)
 	if !ok {
-		fmt.Printf("Coluna 0 de %s.%s não é INT assinado (tipo %T); evento ignorado\n",
-			rowsEvent.Table.Schema, rowsEvent.Table.Table, newRow[0])
+		r.log.Warn("Coluna 0 não é INT assinado; evento ignorado",
+			"tenant", rowsEvent.Table.Schema,
+			"table", rowsEvent.Table.Table,
+			"tipo", fmt.Sprintf("%T", newRow[0]))
 		return Event{}, false
 	}
 	event := Event{

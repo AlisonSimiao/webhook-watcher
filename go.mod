@@ -2,7 +2,11 @@ module webhook-watcher
 
 go 1.26.2
 
-require github.com/go-mysql-org/go-mysql v1.16.0
+require (
+	github.com/go-mysql-org/go-mysql v1.16.0
+	github.com/joho/godotenv v1.5.1
+	modernc.org/sqlite v1.55.0
+)
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -27,5 +31,4 @@ require (
 	modernc.org/libc v1.74.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.55.0 // indirect
 )
