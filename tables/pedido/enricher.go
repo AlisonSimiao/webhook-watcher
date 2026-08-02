@@ -49,18 +49,20 @@ func (e *PedidoEnricher) Enrich(recurso *PedidoRecurso) {
 		}
 	}
 
-	if recurso.Codigo != "" || recurso.Numero > 0 {
-		pedId := recurso.Codigo
-		if pedId == "" {
-			pedId = fmt.Sprintf("%d", recurso.Numero)
-		}
-
-		queryItens := fmt.Sprintf("SELECT sequencia, codigo_produto, codigo_empresa, codigo_cor, codigo_unidade_medida, "+
-			"quantidade, preco_bruto, preco_liquido, codigo_integracao "+
-			"FROM %s WHERE codigo_pedido = ?", e.tableName("pedido_item"))
-		rows, err := e.db.Query(queryItens, pedId)
+	if recurso.ID > 0 {
+		// Colunas mapeadas do schema real de pedidos_produtos (COALESCE para
+		// NULLs). codigo_empresa/codigo_cor/codigo_unidade_medida não existem na
+		// tabela — exigiriam JOINs (produtos_representadas, produtos_opcoes_item).
+		queryItens := fmt.Sprintf(`SELECT COALESCE(sequencia, 0), COALESCE(codigo, ''),
+			COALESCE(codigo_integracao, ''), COALESCE(quantidade, 0),
+			COALESCE(preco, 0), COALESCE(preco_original, 0),
+			COALESCE(faturado, 0), COALESCE(cancelado, 0), COALESCE(peso, 0),
+			COALESCE(desconto, 0), COALESCE(icms_valor, 0), COALESCE(ipi_valor, 0),
+			COALESCE(informacoes, ''), data_emissao, COALESCE(previsao_faturamento, '')
+			FROM %s WHERE id_pedido = ?`, e.tableName("pedidos_produtos"))
+		rows, err := e.db.Query(queryItens, recurso.ID)
 		if err != nil {
-			e.log.Warn("Não foi possível buscar itens do pedido", "codigo_pedido", pedId, "error", err)
+			e.log.Warn("Não foi possível buscar itens do pedido", "id_pedido", recurso.ID, "error", err)
 		} else {
 			defer rows.Close()
 			var itens []PedidoItem
@@ -69,21 +71,27 @@ func (e *PedidoEnricher) Enrich(recurso *PedidoRecurso) {
 				if errScan := rows.Scan(
 					&item.Sequencia,
 					&item.CodigoProduto,
-					&item.CodigoEmpresa,
-					&item.CodigoCor,
-					&item.CodigoUnidadeMedida,
-					&item.Quantidade,
-					&item.PrecoBruto,
-					&item.PrecoLiquido,
 					&item.CodigoIntegracao,
+					&item.Quantidade,
+					&item.PrecoLiquido,
+					&item.PrecoBruto,
+					&item.Faturado,
+					&item.Cancelado,
+					&item.Peso,
+					&item.Desconto,
+					&item.Icms,
+					&item.Ipi,
+					&item.Informacoes,
+					&item.DataEmissao,
+					&item.DataPrevisaoFaturamento,
 				); errScan != nil {
-					e.log.Warn("Não foi possível escanear item do pedido", "codigo_pedido", pedId, "error", errScan)
+					e.log.Warn("Não foi possível escanear item do pedido", "id_pedido", recurso.ID, "error", errScan)
 					continue
 				}
 				itens = append(itens, item)
 			}
 			if err := rows.Err(); err != nil {
-				e.log.Warn("Erro ao iterar itens do pedido", "codigo_pedido", pedId, "error", err)
+				e.log.Warn("Erro ao iterar itens do pedido", "id_pedido", recurso.ID, "error", err)
 			}
 			if len(itens) > 0 {
 				recurso.Itens = itens

@@ -42,6 +42,9 @@ func (p *PedidoProcessor) Process(ctx *tables.TableContext) (interface{}, error)
 func parsePedidoRecursoFromRow(row []interface{}) PedidoRecurso {
 	rec := PedidoRecurso{}
 
+	if len(row) > 0 {
+		rec.ID = fmtValInt(row[0])
+	}
 	if len(row) > 1 {
 		rec.Codigo = fmtValString(row[1])
 	}

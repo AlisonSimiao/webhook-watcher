@@ -16,9 +16,9 @@ type PedidoItem struct {
 	CodigoUnidadeMedida     string  `json:"codigoUnidadeMedida"`
 	DataEmissao             string  `json:"dataEmissao"`
 	DataPrevisaoFaturamento string  `json:"dataPrevisaoFaturamento"`
-	Faturado                int     `json:"faturado"`
+	Faturado                float64 `json:"faturado"`
 	Quantidade              float64 `json:"quantidade"`
-	Cancelado               int     `json:"cancelado"`
+	Cancelado               float64 `json:"cancelado"`
 	Peso                    float64 `json:"peso"`
 	Desconto                float64 `json:"desconto"`
 	PrecoBruto              float64 `json:"precoBruto"`
@@ -31,6 +31,7 @@ type PedidoItem struct {
 
 type PedidoRecurso struct {
 	Tenant                      string        `json:"tenant"`
+	ID                          int           `json:"id"`
 	Codigo                      string        `json:"codigo"`
 	Numero                      int           `json:"numero"`
 	CodigoDeposito              string        `json:"codigoDeposito"`

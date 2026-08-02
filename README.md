@@ -34,6 +34,54 @@ filter msg like /binlog/
 
 O log `create BinlogSyncer` da go-mysql (config não serializável) é descartado pelo `dropMessageHandler`.
 
+## System design
+
+Estado atual do projeto — o watcher é um binário Go único que replica o binlog do MariaDB, roteia os eventos para as estratégias registradas e emite cada evento como log JSON no stdout (pronto para CloudWatch). O consumer (fila + HTTP) ainda não existe (ver [Próximos passos](#próximos-passos)).
+
+```mermaid
+flowchart LR
+    subgraph Ext["Externos"]
+        MDB[("MariaDB<br/>binlog + dados")]
+        SQLITE[("servers.db<br/>binlog_servers")]
+        ENV["config.env<br/>credenciais de seed"]
+        CLOUD["CloudWatch<br/>Logs Insights"]
+    end
+
+    subgraph App["Webhook Watcher (binário Go)"]
+        direction TB
+        MAIN["main.go"]
+        BW["BinlogWatcher.Start()<br/>1 goroutine por servidor"]
+        PROD["Producer.HandleEvent()<br/>producer/"]
+        REG["Registry<br/>map EventType → EventStrategy"]
+        UPD["UpdateRowsStrategy<br/>UPDATE v1/v2 + MariaDB comprimido"]
+        ROW["RowsStrategy<br/>eachRow + buildEvent"]
+        DISP["dispatchTable"]
+        PED["TableProcessor pedido<br/>tables/pedido"]
+        ENR["Enricher<br/>queries de enriquecimento"]
+        GEN["Event genérico"]
+        LOG["log JSON estruturado → stdout"]
+    end
+
+    ENV -. "seed" .-> SQLITE
+    SQLITE -->|"LoadServersFromDB"| MAIN
+    MAIN -->|"goroutine por servidor"| BW
+    BW --o|"SHOW MASTER STATUS + stream do binlog"| MDB
+    BW -->|"eventos"| PROD
+    PROD --> REG
+    REG --> UPD
+    UPD --> ROW
+    ROW --> DISP
+    DISP -->|"tabela customizada"| PED
+    PED --> ENR
+    ENR --o|"queries de enriquecimento"| MDB
+    DISP -->|"fallback genérico"| GEN
+    PED --> LOG
+    GEN --> LOG
+    LOG --> CLOUD
+```
+
+Fluxo resumido: `main.go` carrega os servidores do SQLite (semeando do `.env` quando vazio), dispara uma goroutine por servidor que replica o binlog do MariaDB a partir da posição atual, o `Producer` roteia cada evento para a estratégia do tipo (`UPDATE`), e a estratégia despacha para o `TableProcessor` customizado (com enriquecimento via queries no MariaDB) ou monta o evento genérico — ambos emitidos como log JSON.
+
 ## Arquitetura
 
 ```

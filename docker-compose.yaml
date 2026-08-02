@@ -1,0 +1,34 @@
+# Infra de desenvolvimento do Webhook Watcher.
+# Subir tudo: docker compose up -d
+# Subir apenas Redis: docker compose up -d redis
+# Painel asynqmon: http://localhost:8080
+# (o MariaDB é externo e configurado no .env / binlog_servers)
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: webhook-watcher-redis
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  asynqmon:
+    image: hibiken/asynqmon
+    container_name: webhook-watcher-asynqmon
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    command: ["--redis-addr=redis:5000"]
+
+volumes:
+  redis-data:
