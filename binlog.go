@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"webhook-watcher/config"
+	"webhook-watcher/pkg/queue"
 	"webhook-watcher/producer"
 
 	"github.com/go-mysql-org/go-mysql/client"
@@ -17,12 +18,13 @@ import (
 )
 
 type BinlogWatcher struct {
-	cfg config.ServerConfig
-	log *slog.Logger
+	cfg      config.ServerConfig
+	log      *slog.Logger
+	enqueuer queue.Enqueuer
 }
 
-func newBinlogWatcher(cfg config.ServerConfig, logger *slog.Logger) *BinlogWatcher {
-	return &BinlogWatcher{cfg: cfg, log: logger.With("server_id", cfg.ServerID)}
+func newBinlogWatcher(cfg config.ServerConfig, logger *slog.Logger, enqueuer queue.Enqueuer) *BinlogWatcher {
+	return &BinlogWatcher{cfg: cfg, log: logger.With("server_id", cfg.ServerID), enqueuer: enqueuer}
 }
 
 func (b *BinlogWatcher) Start() error {
@@ -85,7 +87,7 @@ func (b *BinlogWatcher) Start() error {
 		defer mariadb.Close()
 	}
 
-	prod := producer.NewProducer(b.log, mariadb)
+	prod := producer.NewProducer(b.log, mariadb, b.enqueuer)
 
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

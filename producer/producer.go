@@ -1,6 +1,7 @@
 package producer
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -8,27 +9,13 @@ import (
 	"log/slog"
 
 	"github.com/go-mysql-org/go-mysql/replication"
+
+	"webhook-watcher/pkg/queue"
 )
-
-type Action string
-
-const (
-	ActionInsert Action = "INSERT"
-	ActionUpdate Action = "UPDATE"
-	ActionDelete Action = "DELETE"
-)
-
-type Event struct {
-	ID         string `json:"id"`
-	ResourceID int    `json:"resource_id"`
-	Tenant     string `json:"tenant"`
-	Action     Action `json:"action"`
-	Table      string `json:"table"`
-	Timestamp  int64  `json:"timestamp"`
-}
 
 // EventContext agrupa os dados comuns a toda estratégia de evento.
 type EventContext struct {
+	Ctx        context.Context
 	BinlogFile string
 	BinlogPos  uint32
 	Event      *replication.BinlogEvent
@@ -40,18 +27,21 @@ type EventStrategy interface {
 	Handle(ctx *EventContext) error
 }
 
-// Producer despacha cada tipo de evento para a estratégia registrada.
+// Producer despacha cada tipo de evento para a estratégia registrada e enfileira
+// os eventos gerados na fila via Enqueuer.
 type Producer struct {
 	strategies map[replication.EventType]EventStrategy
 	log        *slog.Logger
 	db         *sql.DB
+	enqueuer   queue.Enqueuer
 }
 
-func NewProducer(logger *slog.Logger, db *sql.DB) *Producer {
+func NewProducer(logger *slog.Logger, db *sql.DB, enqueuer queue.Enqueuer) *Producer {
 	update := &UpdateRowsStrategy{
 		RowsStrategy: RowsStrategy{
 			log:        logger,
 			db:         db,
+			enqueuer:   enqueuer,
 			processors: defaultProcessors(),
 		},
 	}
@@ -61,8 +51,9 @@ func NewProducer(logger *slog.Logger, db *sql.DB) *Producer {
 			replication.UPDATE_ROWS_EVENTv2:                     update,
 			replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1: update,
 		},
-		log: logger,
-		db:  db,
+		log:      logger,
+		db:       db,
+		enqueuer: enqueuer,
 	}
 }
 
@@ -73,14 +64,15 @@ func (p *Producer) HandleEvent(binlogFile string, binlogPos uint32, ev *replicat
 		return nil
 	}
 	return strategy.Handle(&EventContext{
+		Ctx:        context.Background(),
 		BinlogFile: binlogFile,
 		BinlogPos:  binlogPos,
 		Event:      ev,
 	})
 }
 
-func generateEventID(binlogFile string, logPos uint32, rowIndex int, event Event) string {
-	raw := fmt.Sprintf("%s:%d:%d:%s:%s:%d", binlogFile, logPos, rowIndex, event.Tenant, event.Table, event.ResourceID)
+func generateEventID(binlogFile string, logPos uint32, rowIndex int, tenant, table string, resourceID int) string {
+	raw := fmt.Sprintf("%s:%d:%d:%s:%s:%d", binlogFile, logPos, rowIndex, tenant, table, resourceID)
 	hash := sha256.Sum256([]byte(raw))
 
 	return "evt_" + hex.EncodeToString(hash[:16])

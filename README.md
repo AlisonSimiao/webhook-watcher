@@ -2,7 +2,7 @@
 
 Watcher de binlog do MariaDB em Go que transforma alterações de linhas em eventos de webhook.
 
-O programa se conecta como um **replicador** ao MariaDB, lê o binlog em tempo real e, para cada `UPDATE` detectado, extrai o recurso afetado e gera um evento estruturado. Hoje o evento é apenas impresso no stdout; um consumer com fila e envio HTTP está no roadmap (ver [Próximos passos](#próximos-passos)).
+O programa se conecta como um **replicador** ao MariaDB, lê o binlog em tempo real e, para cada `UPDATE` em tabela com `TableProcessor` registrado, extrai o recurso afetado, enriquece via queries e **enfileira o evento no Redis** (asynq). O consumer que monta o webhook e dispara o HTTP está no roadmap (ver [Próximos passos](#próximos-passos)).
 
 ## Como funciona
 
@@ -10,16 +10,18 @@ O programa se conecta como um **replicador** ao MariaDB, lê o binlog em tempo r
 2. `config.LoadServersFromDB()` carrega os servidores ativos (`is_active = 1`).
 3. Uma **goroutine por servidor** roda `BinlogWatcher.Start()`, que conecta ao MariaDB e executa `SHOW MASTER STATUS` para obter a posição atual do binlog — o stream começa a partir daí (não há resume após restart).
 4. Em um loop, cada evento do binlog é roteado pelo `Producer` para a **estratégia** correspondente ao tipo de evento.
-5. Para `UPDATE`, as linhas chegam em pares old/new; a linha nova é usada para montar o evento (`resource_id`, tenant, tabela, timestamp) com um ID único.
-6. O evento é emitido como uma linha de log estruturada em JSON (campo `evento`).
+5. Para `UPDATE`, as linhas chegam em pares old/new. Apenas tabelas com `TableProcessor` registrado (ex: `pedidos`) geram eventos: a linha nova é enriquecida com queries no MariaDB e vira o payload do evento, com um ID único.
+6. O evento é **enfileirado** via `queue.Enqueuer` (Redis + asynq, idempotente por `TaskID`) e também logado em JSON (campo `evento`).
 
 ## Logs estruturados (CloudWatch)
 
 Todos os logs são **JSON estruturado** via `slog`, uma linha por registro, com `time`, `level`, `msg` e atributos pesquisáveis — ideal para CloudWatch Logs Insights:
 
 ```json
-{"time":"2026-08-02T01:37:19.029Z","level":"INFO","msg":"Evento processado","server_id":"DB01","evento":{"id":"evt_abc","resource_id":123,"tenant":"meu_tenant","action":"UPDATE","table":"clientes","timestamp":1780000000}}
+{"time":"2026-08-02T01:37:19.029Z","level":"INFO","msg":"Evento processado","server_id":"DB01","evento":{"id":"evt_ab12cd34...","tenant":"meu_tenant","table":"pedidos","action":"UPDATE","timestamp":1780000000,"payload":{"tipoModificacao":"M","recurso":{...}}}}
 ```
+
+> O log é a **observabilidade** — o caminho principal de cada evento é a **fila** (Redis), não o stdout. O consumer que lerá a fila e disparará o webhook está no roadmap.
 
 Exemplos de consultas:
 
@@ -36,7 +38,7 @@ O log `create BinlogSyncer` da go-mysql (config não serializável) é descartad
 
 ## System design
 
-Estado atual do projeto — o watcher é um binário Go único que replica o binlog do MariaDB, roteia os eventos para as estratégias registradas e emite cada evento como log JSON no stdout (pronto para CloudWatch). O consumer (fila + HTTP) ainda não existe (ver [Próximos passos](#próximos-passos)).
+Estado atual do projeto — o watcher é um binário Go único que replica o binlog do MariaDB, roteia os eventos para as estratégias registradas, enriquece as tabelas customizadas e **enfileira cada evento no Redis (asynq)**; o mesmo evento também é logado como JSON (CloudWatch). O consumer (montar webhook + HTTP) ainda não existe (ver [Próximos passos](#próximos-passos)).
 
 ```mermaid
 flowchart LR
@@ -44,6 +46,9 @@ flowchart LR
         MDB[("MariaDB<br/>binlog + dados")]
         SQLITE[("servers.db<br/>binlog_servers")]
         ENV["config.env<br/>credenciais de seed"]
+        REDIS[("Redis<br/>fila webhook-events<br/>(asynq)")]
+        ASYNQMON["asynqmon<br/>painel de filas"]
+        HTTP["Webhook HTTP<br/>(consumer futuro)"]
         CLOUD["CloudWatch<br/>Logs Insights"]
     end
 
@@ -54,12 +59,12 @@ flowchart LR
         PROD["Producer.HandleEvent()<br/>producer/"]
         REG["Registry<br/>map EventType → EventStrategy"]
         UPD["UpdateRowsStrategy<br/>UPDATE v1/v2 + MariaDB comprimido"]
-        ROW["RowsStrategy<br/>eachRow + buildEvent"]
+        ROW["RowsStrategy<br/>eachRow + emit"]
         DISP["dispatchTable"]
         PED["TableProcessor pedido<br/>tables/pedido"]
         ENR["Enricher<br/>queries de enriquecimento"]
-        GEN["Event genérico"]
-        LOG["log JSON estruturado → stdout"]
+        ENQ["Enqueuer<br/>pkg/queue"]
+        LOG["observabilidade:<br/>log JSON → stdout"]
     end
 
     ENV -. "seed" .-> SQLITE
@@ -71,16 +76,20 @@ flowchart LR
     REG --> UPD
     UPD --> ROW
     ROW --> DISP
-    DISP -->|"tabela customizada"| PED
+    DISP -->|"tabela com processor"| PED
     PED --> ENR
     ENR --o|"queries de enriquecimento"| MDB
-    DISP -->|"fallback genérico"| GEN
+    PED -->|"evento enriquecido"| ENQ
+    ENQ -->|"Enqueue (asynq)"| REDIS
+    REDIS --> ASYNQMON
+    REDIS -.->|"consumer (roadmap)"| HTTP
     PED --> LOG
-    GEN --> LOG
     LOG --> CLOUD
 ```
 
-Fluxo resumido: `main.go` carrega os servidores do SQLite (semeando do `.env` quando vazio), dispara uma goroutine por servidor que replica o binlog do MariaDB a partir da posição atual, o `Producer` roteia cada evento para a estratégia do tipo (`UPDATE`), e a estratégia despacha para o `TableProcessor` customizado (com enriquecimento via queries no MariaDB) ou monta o evento genérico — ambos emitidos como log JSON.
+Fluxo resumido: `main.go` carrega os servidores do SQLite (semeando do `.env` quando vazio), dispara uma goroutine por servidor que replica o binlog do MariaDB a partir da posição atual, o `Producer` roteia cada evento para a estratégia do tipo (`UPDATE`), e a estratégia despacha para o `TableProcessor` registrado (com enriquecimento via queries no MariaDB). Tabelas sem processor não geram evento.
+
+**Produção de eventos para a fila (caminho principal):** para cada UPDATE em uma tabela monitorada, o producer monta o envelope (`queue.Event` com ID único) + payload enriquecido e faz `Enqueue` via `queue.Enqueuer` (asynq) → Redis. O enqueue é **idempotente** (`TaskID` = `Event.ID`). O consumer que lerá essa fila e disparará o webhook HTTP está no roadmap. O log JSON para o stdout/CloudWatch é apenas observabilidade.
 
 ## Arquitetura
 
@@ -93,18 +102,22 @@ main.go → config.InitDB() + LoadServersFromDB() → goroutine por servidor
 - **`main.go`** — entrypoint e wiring: inicializa o SQLite, carrega os servidores, dispara uma goroutine por servidor e aguarda com `sync.WaitGroup`. Erros de um servidor são logados sem derrubar os demais.
 - **`binlog.go`** — conexão de replicação com o go-mysql, `SHOW MASTER STATUS`, loop de eventos e tratamento de `RotateEvent`. Todas as mensagens levam o prefixo `[server_id]`.
 - **`config/`** — `ServerConfig` (credenciais + `ReplicaID` do binlog), `InitDB`, `LoadServersFromDB` e `DefaultServerConfig` (servidor de seed). Driver SQLite CGO-free (`modernc.org/sqlite`).
-- **`producer/`** — `Producer` com um registro `map[EventType]EventStrategy`. Adicionar novo tipo de evento = nova estratégia + entrada no mapa, sem tocar no dispatcher. `UpdateRowsStrategy` (update.go) trata UPDATE v1/v2 + compactado MariaDB e reutiliza a base `RowsStrategy` (rows.go), que contém a iteração de linhas (`eachRow`) e a montagem do evento (`buildEvent`).
+- **`producer/`** — `Producer` com um registro `map[EventType]EventStrategy`. Adicionar novo tipo de evento = nova estratégia + entrada no mapa, sem tocar no dispatcher. `UpdateRowsStrategy` (update.go) trata UPDATE v1/v2 + compactado MariaDB e reutiliza a base `RowsStrategy` (rows.go): `eachRow` itera os pares old/new, `rowResourceID` extrai o id da coluna 0 (int32/uint32) e `emit` enfileira o evento via `queue.Enqueuer`. **Apenas tabelas com `TableProcessor` registrado geram eventos** — as demais são logadas em Debug.
+- **`pkg/queue/`** — port de fila (Ports & Adapters): `Enqueuer` (Enqueue/Close), envelope `Event` e `MemoryQueue` para testes. `RedisQueue` é o adapter Redis via **asynq**, usando `Event.ID` como `TaskID` para **enqueue idempotente** (`ErrDuplicate`); `RedisWorker` é o lado consumer (handler tipado com retry/backoff/DLQ gerenciados pelo asynq).
 
-**Evento gerado** (impresso como JSON):
+**Evento gerado** (envelope da fila, logado como `evento`):
 
 ```json
 {
   "id": "evt_ab12cd34...",
-  "resource_id": 123,
   "tenant": "meu_tenant",
+  "table": "pedidos",
   "action": "UPDATE",
-  "table": "clientes",
-  "timestamp": 1780000000
+  "timestamp": 1780000000,
+  "payload": {
+    "tipoModificacao": "M",
+    "recurso": { "id": 123, "codigo": "PED-00123", "status": 1, "...": "campos do pedido" }
+  }
 }
 ```
 
@@ -145,6 +158,7 @@ DB_PORT=3306
 DB_USER=root
 DB_PASSWORD=kodejifr
 DB_FLAVOR=mariadb
+REDIS_ADDR=localhost:6379
 ```
 
 `replica_id` é `UNIQUE` — o ID de réplica do binlog precisa ser único por servidor escutado (dois watchers com o mesmo ID contra o mesmo MariaDB são rejeitados pelo source). Para cadastrar outro servidor, insira na tabela e reinicie:
@@ -178,11 +192,18 @@ O `replica-id` é único: adicionar um servidor com `replica_id` ou `server_id` 
 
 ## Como rodar
 
+O Redis é obrigatório (fila de eventos). Suba a infra e configure `REDIS_ADDR`:
+
 ```bash
+docker compose up -d          # Redis + asynqmon (http://localhost:8080)
+# no .env: REDIS_ADDR=localhost:6379
+
 go build ./...
 go vet ./...
 go run .
 ```
+
+Sem `REDIS_ADDR`, o watcher falha na inicialização com instrução para subir o Redis.
 
 > Use `go build .` ou `go build ./...` para compilar. `go build -o webhook-watcher main.go` compila apenas `main.go` e falha com `undefined: newBinlogWatcher`, pois `binlog.go` e `producer.go` também são `package main`.
 
@@ -200,23 +221,28 @@ docker build -f DockerFile -t webhook-watcher .
 .
 ├── .env.example            # variáveis do servidor padrão (copie para .env)
 ├── binlog.go               # watcher de binlog (package main)
+├── docker-compose.yaml     # Redis + asynqmon (infra local de dev)
 ├── logging.go              # dropMessageHandler (filtra logs não serializáveis)
 ├── main.go                 # entrypoint (package main)
 ├── server_cmd.go           # subcomandos server add/list/update/remove
 ├── config/config.go        # ServerConfig, InitDB, LoadServersFromDB (SQLite)
-├── producer/producer.go    # Producer, EventStrategy, Event, registry
-├── producer/rows.go        # RowsStrategy (base de eventos ROWS)
+├── pkg/queue/queue.go      # port Enqueuer + envelope Event
+├── pkg/queue/redis.go      # adapter RedisQueue (asynq, enqueue idempotente)
+├── pkg/queue/redis_consumer.go # RedisWorker (consumer side)
+├── pkg/queue/memory.go     # MemoryQueue (testes)
+├── producer/producer.go    # Producer, EventStrategy, registry
+├── producer/rows.go        # RowsStrategy (eachRow, rowResourceID, emit)
 ├── producer/update.go      # UpdateRowsStrategy
+├── tables/                 # TableProcessor + processors (pedido)
 ├── servers.db              # SQLite com binlog_servers (criado na 1ª execução)
-└── go.mod                  # go-mysql-org/go-mysql, modernc.org/sqlite
+└── go.mod                  # go-mysql-org/go-mysql, modernc.org/sqlite, asynq
 ```
 
 ## Próximos passos
 
-- **Fila + consumer**: hoje o produtor só imprime eventos. O plano é enfileirar os eventos e ter um consumer que:
-  1. lê o evento da fila;
-  2. enriquece com queries no banco;
-  3. monta o payload do webhook;
-  4. dispara o request HTTP com retry/backoff.
-- **Fila recomendada**: Redis + [asynq](https://github.com/hibiken/asynq) (retry, backoff, dead-letter embutidos). Alternativa sem infra nova: tabela-fila no próprio MariaDB.
-- **Novos tipos de evento**: INSERT/DELETE (reutilizando `RowsStrategy` com stride/offset próprios).
+- **Consumer**: a fila já está pronta (Redis + asynq, retry/backoff/dead-letter embutidos). Falta o consumer que:
+  1. lê o evento da fila (`RedisWorker.Handle`);
+  2. monta o payload do webhook a partir do evento enriquecido;
+  3. dispara o request HTTP com retry/backoff.
+- **Enriquecimento no consumer**: hoje o enriquecimento (queries no MariaDB) acontece no producer, antes do enqueue; mover para o consumer é opcional.
+- **Novos tipos de evento**: INSERT/DELETE (reutilizando `RowsStrategy` com stride/offset próprios, na mesma linha do UPDATE).

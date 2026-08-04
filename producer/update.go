@@ -1,9 +1,13 @@
 package producer
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/go-mysql-org/go-mysql/replication"
+
+	"webhook-watcher/pkg/queue"
 )
 
 // UpdateRowsStrategy trata eventos de UPDATE (pares old/new).
@@ -15,25 +19,44 @@ func (s *UpdateRowsStrategy) Handle(ctx *EventContext) error {
 	s.log.Debug("Evento recebido", "tipo", ctx.Event.Header.EventType.String())
 	return s.eachRow(ctx, 2, 1, func(rowIndex int, newRow []interface{}) error {
 		rowsEvent := ctx.Event.Event.(*replication.RowsEvent)
+		schema := string(rowsEvent.Table.Schema)
 		tableName := strings.ToLower(string(rowsEvent.Table.Table))
 
-		// Tenta despachar para um TableProcessor registrado
-		res, handled, err := s.dispatchTable(string(rowsEvent.Table.Schema), tableName, "UPDATE", newRow, nil)
+		resourceID, ok := rowResourceID(newRow)
+		if !ok {
+			s.log.Warn("Coluna 0 não é INT assinado; evento ignorado",
+				"tenant", schema,
+				"table", tableName,
+				"tipo", fmt.Sprintf("%T", newRow[0]))
+			return nil
+		}
+
+		// Apenas tabelas com TableProcessor registrado geram eventos.
+		res, handled, err := s.dispatchTable(schema, tableName, string(queue.ActionUpdate), newRow, nil)
 		if err != nil {
 			s.log.Error("Erro ao processar tabela com TableProcessor", "tabela", tableName, "error", err)
 			return err
 		}
-		if handled {
-			s.log.Info("Evento customizado de tabela processado", "tabela", tableName, "evento", res)
+		if !handled {
+			s.log.Debug("Tabela sem TableProcessor; nenhum evento emitido", "tabela", tableName)
 			return nil
 		}
 
-		// Fallback genérico para eventos não customizados
-		event, ok := s.buildEvent(ctx, rowsEvent, ActionUpdate, rowIndex, newRow)
-		if !ok {
-			return nil
+		payload, err := json.Marshal(res)
+		if err != nil {
+			s.log.Error("Erro ao serializar payload do evento", "tabela", tableName, "error", err)
+			return err
 		}
-		s.log.Info("Evento processado", "evento", event)
+
+		event := &queue.Event{
+			ID:        generateEventID(ctx.BinlogFile, ctx.BinlogPos, rowIndex, schema, tableName, resourceID),
+			Tenant:    schema,
+			Table:     tableName,
+			Action:    queue.ActionUpdate,
+			Timestamp: int64(ctx.Event.Header.Timestamp),
+			Payload:   payload,
+		}
+		s.emit(ctx.Ctx, event)
 		return nil
 	})
 }

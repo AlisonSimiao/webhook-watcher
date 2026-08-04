@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"webhook-watcher/config"
+	"webhook-watcher/pkg/queue"
 
 	"github.com/joho/godotenv"
 )
@@ -25,6 +26,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "server" {
 		os.Exit(runServerCommand(os.Args[2:]))
 	}
+
+	enqueuer := initQueue()
+	defer enqueuer.Close()
 
 	slog.Info("Iniciando Webhook Watcher")
 
@@ -61,10 +65,21 @@ func main() {
 		wg.Add(1)
 		go func(cfg config.ServerConfig) {
 			defer wg.Done()
-			if err := newBinlogWatcher(cfg, slog.Default()).Start(); err != nil {
+			if err := newBinlogWatcher(cfg, slog.Default(), enqueuer).Start(); err != nil {
 				slog.Error("Servidor encerrado com erro", "server_id", cfg.ServerID, "error", err)
 			}
 		}(s)
 	}
 	wg.Wait()
+}
+
+// initQueue cria o adapter da fila de eventos. O Redis é obrigatório (subido via
+// docker compose up -d); sem REDIS_ADDR o watcher falha na inicialização.
+func initQueue() queue.Enqueuer {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		slog.Error("REDIS_ADDR não definida; suba o Redis com 'docker compose up -d'")
+		os.Exit(1)
+	}
+	return queue.NewRedisQueue(addr)
 }
