@@ -8,7 +8,7 @@ O programa se conecta como um **replicador** ao MariaDB, lê o binlog em tempo r
 
 1. `config.InitDB()` abre/cria o SQLite (`servers.db` por padrão, configurável via `SQLITE_PATH`) e garante o esquema `binlog_servers`. Se não houver servidores cadastrados, um servidor padrão é semeado a partir do `.env` (ou valores de desenvolvimento).
 2. `config.LoadServersFromDB()` carrega os servidores ativos (`is_active = 1`).
-3. Uma **goroutine por servidor** roda `BinlogWatcher.Start()`, que conecta ao MariaDB e executa `SHOW MASTER STATUS` para obter a posição atual do binlog — o stream começa a partir daí (não há resume após restart).
+3. Uma **goroutine por servidor** roda `BinlogWatcher.Start()`. Se o servidor já tem uma posição salva em `binlog_servers` (`binlog_file`/`binlog_pos`), o stream **retoma exatamente daquele ponto**; na primeira execução (posição vazia), consulta `SHOW MASTER STATUS` e começa a partir da posição atual do master. A posição é persistida periodicamente (a cada rotação de binlog, a cada 5s de avanço, e ao encerrar), garantindo resume-on-restart por servidor.
 4. Em um loop, cada evento do binlog é roteado pelo `Producer` para a **estratégia** correspondente ao tipo de evento.
 5. Para `UPDATE`, as linhas chegam em pares old/new. Apenas tabelas com `TableProcessor` registrado (ex: `pedidos`) geram eventos: a linha nova é enriquecida com queries no MariaDB e vira o payload do evento, com um ID único.
 6. O evento é **enfileirado** via `queue.Enqueuer` (Redis + asynq, idempotente por `TaskID`) e também logado em JSON (campo `evento`).
@@ -44,7 +44,7 @@ Estado atual do projeto — o watcher é um binário Go único que replica o bin
 flowchart LR
     subgraph Ext["Externos"]
         MDB[("MariaDB<br/>binlog + dados")]
-        SQLITE[("servers.db<br/>binlog_servers")]
+        SQLITE[("servers.db<br/>binlog_servers<br/>+ binlog_file/binlog_pos")]
         ENV["config.env<br/>credenciais de seed"]
         REDIS[("Redis<br/>fila webhook-events<br/>(asynq)")]
         ASYNQMON["asynqmon<br/>painel de filas"]
@@ -68,9 +68,10 @@ flowchart LR
     end
 
     ENV -. "seed" .-> SQLITE
-    SQLITE -->|"LoadServersFromDB"| MAIN
+    SQLITE -->|"LoadServersFromDB (posição salva ou vazia)"| MAIN
     MAIN -->|"goroutine por servidor"| BW
-    BW --o|"SHOW MASTER STATUS + stream do binlog"| MDB
+    BW --o|"resume da posição salva, ou SHOW MASTER STATUS na 1ª vez + stream do binlog"| MDB
+    BW -.->|"persiste binlog_file/binlog_pos<br/>(rotação, ~5s, shutdown)"| SQLITE
     BW -->|"eventos"| PROD
     PROD --> REG
     REG --> UPD
@@ -87,7 +88,7 @@ flowchart LR
     LOG --> CLOUD
 ```
 
-Fluxo resumido: `main.go` carrega os servidores do SQLite (semeando do `.env` quando vazio), dispara uma goroutine por servidor que replica o binlog do MariaDB a partir da posição atual, o `Producer` roteia cada evento para a estratégia do tipo (`UPDATE`), e a estratégia despacha para o `TableProcessor` registrado (com enriquecimento via queries no MariaDB). Tabelas sem processor não geram evento.
+Fluxo resumido: `main.go` carrega os servidores do SQLite (semeando do `.env` quando vazio), dispara uma goroutine por servidor que replica o binlog do MariaDB retomando da última posição persistida para aquele servidor (ou da posição atual via `SHOW MASTER STATUS` na primeira execução), o `Producer` roteia cada evento para a estratégia do tipo (`UPDATE`), e a estratégia despacha para o `TableProcessor` registrado (com enriquecimento via queries no MariaDB). Tabelas sem processor não geram evento. Cada watcher também persiste sua posição de leitura de volta no SQLite (a cada rotação de binlog, a cada ~5s de avanço, e ao encerrar via SIGINT/SIGTERM), permitindo retomar exatamente do ponto onde parou em um restart.
 
 **Produção de eventos para a fila (caminho principal):** para cada UPDATE em uma tabela monitorada, o producer monta o envelope (`queue.Event` com ID único) + payload enriquecido e faz `Enqueue` via `queue.Enqueuer` (asynq) → Redis. O enqueue é **idempotente** (`TaskID` = `Event.ID`). O consumer que lerá essa fila e disparará o webhook HTTP está no roadmap. O log JSON para o stdout/CloudWatch é apenas observabilidade.
 
@@ -99,9 +100,9 @@ main.go → config.InitDB() + LoadServersFromDB() → goroutine por servidor
     → EventStrategy (Strategy + Registry) → UpdateRowsStrategy → RowsStrategy
 ```
 
-- **`main.go`** — entrypoint e wiring: inicializa o SQLite, carrega os servidores, dispara uma goroutine por servidor e aguarda com `sync.WaitGroup`. Erros de um servidor são logados sem derrubar os demais.
-- **`binlog.go`** — conexão de replicação com o go-mysql, `SHOW MASTER STATUS`, loop de eventos e tratamento de `RotateEvent`. Todas as mensagens levam o prefixo `[server_id]`.
-- **`config/`** — `ServerConfig` (credenciais + `ReplicaID` do binlog), `InitDB`, `LoadServersFromDB` e `DefaultServerConfig` (servidor de seed). Driver SQLite CGO-free (`modernc.org/sqlite`).
+- **`main.go`** — entrypoint e wiring: inicializa o SQLite, carrega os servidores, dispara uma goroutine por servidor e aguarda com `sync.WaitGroup`. Erros de um servidor são logados sem derrubar os demais. Trata `SIGINT`/`SIGTERM` cancelando um `context.Context` compartilhado, dando a cada watcher a chance de persistir a posição final antes de encerrar.
+- **`binlog.go`** — conexão de replicação com o go-mysql, resume da posição salva (ou `SHOW MASTER STATUS` na primeira vez, via `decideStartPosition`), loop de eventos, tratamento de `RotateEvent` e persistência periódica da posição (`BinlogWatcher.persistPosition`, a cada rotação/~5s/encerramento). Todas as mensagens levam o prefixo `[server_id]`.
+- **`config/`** — `ServerConfig` (credenciais + `ReplicaID` do binlog + `BinlogFile`/`BinlogPos`), `InitDB` (cria o schema e migra `servers.db` antigos adicionando `binlog_file`/`binlog_pos` via `ALTER TABLE`, sem perder dados), `LoadServersFromDB`, `UpdateBinlogPosition` e `DefaultServerConfig` (servidor de seed). Driver SQLite CGO-free (`modernc.org/sqlite`).
 - **`producer/`** — `Producer` com um registro `map[EventType]EventStrategy`. Adicionar novo tipo de evento = nova estratégia + entrada no mapa, sem tocar no dispatcher. `UpdateRowsStrategy` (update.go) trata UPDATE v1/v2 + compactado MariaDB e reutiliza a base `RowsStrategy` (rows.go): `eachRow` itera os pares old/new, `rowResourceID` extrai o id da coluna 0 (int32/uint32) e `emit` enfileira o evento via `queue.Enqueuer`. **Apenas tabelas com `TableProcessor` registrado geram eventos** — as demais são logadas em Debug.
 - **`pkg/queue/`** — port de fila (Ports & Adapters): `Enqueuer` (Enqueue/Close), envelope `Event` e `MemoryQueue` para testes. `RedisQueue` é o adapter Redis via **asynq**, usando `Event.ID` como `TaskID` para **enqueue idempotente** (`ErrDuplicate`); `RedisWorker` é o lado consumer (handler tipado com retry/backoff/DLQ gerenciados pelo asynq).
 
@@ -158,7 +159,7 @@ DB_PORT=3306
 DB_USER=root
 DB_PASSWORD=kodejifr
 DB_FLAVOR=mariadb
-REDIS_ADDR=localhost:6379
+REDIS_ADDR=localhost:5000
 ```
 
 `replica_id` é `UNIQUE` — o ID de réplica do binlog precisa ser único por servidor escutado (dois watchers com o mesmo ID contra o mesmo MariaDB são rejeitados pelo source). Para cadastrar outro servidor, insira na tabela e reinicie:
@@ -169,6 +170,8 @@ VALUES ('DB02', 101, '192.168.1.10', 3306, 'watcher', 'senha', 'mariadb');
 ```
 
 Para desativar sem apagar: `UPDATE binlog_servers SET is_active = 0 WHERE server_id = 'DB02';`
+
+A tabela também guarda `binlog_file`/`binlog_pos` — a última posição de leitura de cada servidor, atualizada automaticamente pelo watcher (não é necessário preencher ao cadastrar; ficam vazios/zero até a primeira execução). Para forçar um servidor a reler a partir da posição atual do master (ex: recuperação de binlog corrompido/rotacionado), zere manualmente: `UPDATE binlog_servers SET binlog_file = '', binlog_pos = 0 WHERE server_id = 'DB02';`.
 
 ## Comandos de servidor
 
@@ -196,7 +199,7 @@ O Redis é obrigatório (fila de eventos). Suba a infra e configure `REDIS_ADDR`
 
 ```bash
 docker compose up -d          # Redis + asynqmon (http://localhost:8080)
-# no .env: REDIS_ADDR=localhost:6379
+# no .env: REDIS_ADDR=localhost:5000
 
 go build ./...
 go vet ./...
@@ -221,11 +224,13 @@ docker build -f DockerFile -t webhook-watcher .
 .
 ├── .env.example            # variáveis do servidor padrão (copie para .env)
 ├── binlog.go               # watcher de binlog (package main)
+├── binlog_test.go          # testes de decideStartPosition (resume vs. 1ª execução)
 ├── docker-compose.yaml     # Redis + asynqmon (infra local de dev)
 ├── logging.go              # dropMessageHandler (filtra logs não serializáveis)
 ├── main.go                 # entrypoint (package main)
 ├── server_cmd.go           # subcomandos server add/list/update/remove
-├── config/config.go        # ServerConfig, InitDB, LoadServersFromDB (SQLite)
+├── config/config.go        # ServerConfig, InitDB (+ migração), LoadServersFromDB, UpdateBinlogPosition (SQLite)
+├── config/config_test.go   # testes de migração/persistência da posição do binlog
 ├── pkg/queue/queue.go      # port Enqueuer + envelope Event
 ├── pkg/queue/redis.go      # adapter RedisQueue (asynq, enqueue idempotente)
 ├── pkg/queue/redis_consumer.go # RedisWorker (consumer side)

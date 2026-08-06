@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"webhook-watcher/config"
 	"webhook-watcher/pkg/queue"
@@ -60,12 +63,21 @@ func main() {
 		servers = []config.ServerConfig{seed}
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		slog.Info("Sinal de encerramento recebido, finalizando watchers...")
+		cancel()
+	}()
+
 	var wg sync.WaitGroup
 	for _, s := range servers {
 		wg.Add(1)
 		go func(cfg config.ServerConfig) {
 			defer wg.Done()
-			if err := newBinlogWatcher(cfg, slog.Default(), enqueuer).Start(); err != nil {
+			if err := newBinlogWatcher(cfg, slog.Default(), enqueuer, db).Start(ctx); err != nil {
 				slog.Error("Servidor encerrado com erro", "server_id", cfg.ServerID, "error", err)
 			}
 		}(s)

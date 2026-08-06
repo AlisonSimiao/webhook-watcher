@@ -20,8 +20,8 @@ type ServerConfig struct {
 	User       string
 	Password   string
 	Flavor     string
-	BinlogFile string // apenas em memória (sem resume on restart)
-	BinlogPos  uint32 // apenas em memória (sem resume on restart)
+	BinlogFile string // última posição persistida em binlog_servers (resume on restart)
+	BinlogPos  uint32 // última posição persistida em binlog_servers (resume on restart)
 }
 
 // DefaultServerConfig devolve a configuração padrão de desenvolvimento,
@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS binlog_servers (
     password   TEXT    NOT NULL,
     flavor     TEXT    NOT NULL DEFAULT 'mariadb',
     is_active  INTEGER NOT NULL DEFAULT 1,
+    binlog_file TEXT   NOT NULL DEFAULT '',
+    binlog_pos  INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`
@@ -79,13 +81,56 @@ CREATE TABLE IF NOT EXISTS binlog_servers (
 		return nil, fmt.Errorf("erro ao criar tabela binlog_servers: %w", err)
 	}
 
+	if err := migrateBinlogPositionColumns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return db, nil
+}
+
+// migrateBinlogPositionColumns garante que bancos servers.db criados antes do
+// suporte a resume on restart ganhem as colunas binlog_file/binlog_pos sem
+// perder dados (ALTER TABLE aditivo, nunca recria a tabela).
+func migrateBinlogPositionColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(binlog_servers)`)
+	if err != nil {
+		return fmt.Errorf("erro ao consultar table_info de binlog_servers: %w", err)
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("erro ao ler table_info de binlog_servers: %w", err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("erro ao iterar table_info de binlog_servers: %w", err)
+	}
+	rows.Close()
+
+	if !existing["binlog_file"] {
+		if _, err := db.Exec(`ALTER TABLE binlog_servers ADD COLUMN binlog_file TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("erro ao adicionar coluna binlog_file: %w", err)
+		}
+	}
+	if !existing["binlog_pos"] {
+		if _, err := db.Exec(`ALTER TABLE binlog_servers ADD COLUMN binlog_pos INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("erro ao adicionar coluna binlog_pos: %w", err)
+		}
+	}
+	return nil
 }
 
 // LoadServersFromDB retorna todos os servidores ativos cadastrados.
 func LoadServersFromDB(db *sql.DB) ([]ServerConfig, error) {
 	const query = `
-SELECT id, server_id, replica_id, host, port, user, password, flavor
+SELECT id, server_id, replica_id, host, port, user, password, flavor, binlog_file, binlog_pos
 FROM binlog_servers
 WHERE is_active = 1
 ORDER BY id`
@@ -99,7 +144,7 @@ ORDER BY id`
 	var servers []ServerConfig
 	for rows.Next() {
 		var s ServerConfig
-		if err := rows.Scan(&s.ID, &s.ServerID, &s.ReplicaID, &s.Host, &s.Port, &s.User, &s.Password, &s.Flavor); err != nil {
+		if err := rows.Scan(&s.ID, &s.ServerID, &s.ReplicaID, &s.Host, &s.Port, &s.User, &s.Password, &s.Flavor, &s.BinlogFile, &s.BinlogPos); err != nil {
 			return nil, fmt.Errorf("erro ao ler linha de servidor: %w", err)
 		}
 		servers = append(servers, s)
@@ -114,4 +159,17 @@ ORDER BY id`
 func (c *ServerConfig) SetBinlogData(binlogFile string, binlogPos uint32) {
 	c.BinlogFile = binlogFile
 	c.BinlogPos = binlogPos
+}
+
+// UpdateBinlogPosition persiste a posição de leitura do binlog de um servidor,
+// permitindo retomar a partir dela em um restart futuro.
+func UpdateBinlogPosition(db *sql.DB, serverID string, binlogFile string, binlogPos uint32) error {
+	_, err := db.Exec(
+		`UPDATE binlog_servers SET binlog_file = ?, binlog_pos = ?, updated_at = CURRENT_TIMESTAMP WHERE server_id = ?`,
+		binlogFile, binlogPos, serverID,
+	)
+	if err != nil {
+		return fmt.Errorf("erro ao persistir posição do binlog: %w", err)
+	}
+	return nil
 }

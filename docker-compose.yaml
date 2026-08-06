@@ -9,7 +9,7 @@ services:
     container_name: webhook-watcher-redis
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5000:6379"
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
@@ -28,7 +28,7 @@ services:
         condition: service_healthy
     ports:
       - "8080:8080"
-    command: ["--redis-addr=redis:5000"]
+    command: ["--redis-addr=redis:6379"]
 
 volumes:
   redis-data:

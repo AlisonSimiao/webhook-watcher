@@ -96,7 +96,7 @@ func serverList() int {
 	defer db.Close()
 
 	const query = `
-SELECT id, server_id, replica_id, host, port, user, flavor, is_active
+SELECT id, server_id, replica_id, host, port, user, flavor, is_active, binlog_file, binlog_pos
 FROM binlog_servers
 ORDER BY id`
 
@@ -107,16 +107,16 @@ ORDER BY id`
 	}
 	defer rows.Close()
 
-	fmt.Printf("%-3s %-10s %-10s %-16s %-5s %-12s %-9s %s\n", "id", "server_id", "replica_id", "host", "port", "user", "flavor", "ativo")
+	fmt.Printf("%-3s %-10s %-10s %-16s %-5s %-12s %-9s %-6s %-20s %s\n", "id", "server_id", "replica_id", "host", "port", "user", "flavor", "ativo", "binlog_file", "binlog_pos")
 	for rows.Next() {
-		var id, port, replicaID int
-		var serverID, host, user, flavor string
+		var id, port, replicaID, binlogPos int
+		var serverID, host, user, flavor, binlogFile string
 		var active bool
-		if err := rows.Scan(&id, &serverID, &replicaID, &host, &port, &user, &flavor, &active); err != nil {
+		if err := rows.Scan(&id, &serverID, &replicaID, &host, &port, &user, &flavor, &active, &binlogFile, &binlogPos); err != nil {
 			slog.Error("Erro ao ler linha de servidor", "error", err)
 			return 1
 		}
-		fmt.Printf("%-3d %-10s %-10d %-16s %-5d %-12s %-9s %t\n", id, serverID, replicaID, host, port, user, flavor, active)
+		fmt.Printf("%-3d %-10s %-10d %-16s %-5d %-12s %-9s %-6t %-20s %d\n", id, serverID, replicaID, host, port, user, flavor, active, binlogFile, binlogPos)
 	}
 	if err := rows.Err(); err != nil {
 		slog.Error("Erro ao iterar servidores", "error", err)
