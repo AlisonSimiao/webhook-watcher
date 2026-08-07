@@ -29,6 +29,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "server" {
 		os.Exit(runServerCommand(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "failed-events" {
+		os.Exit(runFailedEventsCommand(os.Args[2:]))
+	}
 
 	enqueuer := initQueue()
 	defer enqueuer.Close()
@@ -77,6 +80,11 @@ func main() {
 		wg.Add(1)
 		go func(cfg config.ServerConfig) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("Panic no watcher; servidor encerrado, demais continuam", "server_id", cfg.ServerID, "recover", r)
+				}
+			}()
 			if err := newBinlogWatcher(cfg, slog.Default(), enqueuer, db).Start(ctx); err != nil {
 				slog.Error("Servidor encerrado com erro", "server_id", cfg.ServerID, "error", err)
 			}

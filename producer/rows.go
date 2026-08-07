@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
+	"webhook-watcher/config"
 	"webhook-watcher/pkg/queue"
 	"webhook-watcher/tables"
 	"webhook-watcher/tables/pedido"
@@ -15,7 +16,9 @@ import (
 // RowsStrategy contém a lógica comum a eventos ROWS (insert/update/delete).
 type RowsStrategy struct {
 	log        *slog.Logger
-	db         *sql.DB
+	db         *sql.DB // MariaDB, para enrich
+	sqliteDB   *sql.DB // servers.db, para dead-letter de eventos
+	serverID   string
 	enqueuer   queue.Enqueuer
 	processors []tables.TableProcessor
 }
@@ -36,8 +39,14 @@ func (r *RowsStrategy) eachRow(ctx *EventContext, stride, newOffset int, visit f
 	}
 	rowIndex := 0
 	for i := 0; i < len(rowsEvent.Rows); i += stride {
+		idx := i + newOffset
+		if idx >= len(rowsEvent.Rows) {
+			r.log.Warn("RowsEvent com número de linhas inesperado (não múltiplo do stride); linha final ignorada",
+				"total_rows", len(rowsEvent.Rows), "stride", stride, "offset", newOffset)
+			break
+		}
 		rowIndex++
-		if err := visit(rowIndex, rowsEvent.Rows[i+newOffset]); err != nil {
+		if err := visit(rowIndex, rowsEvent.Rows[idx]); err != nil {
 			return err
 		}
 	}
@@ -82,15 +91,27 @@ func (r *RowsStrategy) dispatchTable(schema, tableName, action string, newRow, o
 	return nil, false, nil
 }
 
-// emit loga o evento e o enfileira. Erros de enqueue não interrompem o stream
-// do binlog; eventos duplicados (mesmo TaskID) são esperados e apenas logados.
+// emit loga o evento e o enfileira. Eventos duplicados (mesmo TaskID) são
+// esperados e tratados como no-op idempotente. Se o enqueue falhar (ex: Redis
+// indisponível), o evento é salvo em failed_events (servers.db) para consulta
+// e intervenção manual — não há retry nem reprocessamento automático.
 func (r *RowsStrategy) emit(ctx context.Context, event *queue.Event) {
 	r.log.Info("Evento processado", "evento", event)
-	if err := r.enqueuer.Enqueue(ctx, event); err != nil {
-		if queue.IsDuplicate(err) {
-			r.log.Debug("Evento já estava na fila", "id", event.ID)
-			return
-		}
-		r.log.Error("Erro ao enfileirar evento", "id", event.ID, "error", err)
+
+	err := r.enqueuer.Enqueue(ctx, event)
+	if err == nil {
+		return
+	}
+	if queue.IsDuplicate(err) {
+		r.log.Debug("Evento já estava na fila", "id", event.ID)
+		return
+	}
+
+	r.log.Error("Erro ao enfileirar evento; salvando em failed_events", "id", event.ID, "error", err)
+	if r.sqliteDB == nil {
+		return
+	}
+	if saveErr := config.SaveFailedEvent(r.sqliteDB, r.serverID, event.ID, event.Tenant, event.Table, string(event.Action), event.Payload, err.Error()); saveErr != nil {
+		r.log.Error("Erro ao salvar evento descartado em failed_events", "id", event.ID, "error", saveErr)
 	}
 }

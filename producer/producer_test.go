@@ -42,7 +42,7 @@ func pedidoRow() []interface{} {
 
 func TestUpdateStrategyEmitsCustomEvent(t *testing.T) {
 	mem := queue.NewMemoryQueue()
-	prod := NewProducer(testLogger(), nil, mem)
+	prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
 
 	err := prod.HandleEvent("mysql-bin.000001", 123, binlogUpdateEvent("meu_tenant", "pedidos", [][]interface{}{
 		{int32(42)},
@@ -90,7 +90,7 @@ func TestUpdateStrategyEmitsCustomEvent(t *testing.T) {
 
 func TestUpdateStrategySkipsUnregisteredTable(t *testing.T) {
 	mem := queue.NewMemoryQueue()
-	prod := NewProducer(testLogger(), nil, mem)
+	prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
 
 	err := prod.HandleEvent("mysql-bin.000001", 123, binlogUpdateEvent("meu_tenant", "clientes", [][]interface{}{
 		{int32(1)},
@@ -106,7 +106,7 @@ func TestUpdateStrategySkipsUnregisteredTable(t *testing.T) {
 
 func TestUpdateStrategySkipsNonIntID(t *testing.T) {
 	mem := queue.NewMemoryQueue()
-	prod := NewProducer(testLogger(), nil, mem)
+	prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
 
 	err := prod.HandleEvent("mysql-bin.000001", 123, binlogUpdateEvent("meu_tenant", "pedidos", [][]interface{}{
 		{"nao-int"},
@@ -117,6 +117,22 @@ func TestUpdateStrategySkipsNonIntID(t *testing.T) {
 	}
 	if len(mem.Pending()) != 0 {
 		t.Fatalf("esperava nenhum evento com coluna 0 não inteira, obteve %d", len(mem.Pending()))
+	}
+}
+
+func TestUpdateStrategySkipsEmptyRow(t *testing.T) {
+	mem := queue.NewMemoryQueue()
+	prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
+
+	err := prod.HandleEvent("mysql-bin.000001", 123, binlogUpdateEvent("meu_tenant", "pedidos", [][]interface{}{
+		{int32(1)},
+		{}, // linha "new" vazia: não deve dar panic ao indexar newRow[0]
+	}))
+	if err != nil {
+		t.Fatalf("HandleEvent retornou erro: %v", err)
+	}
+	if len(mem.Pending()) != 0 {
+		t.Fatalf("esperava nenhum evento para linha vazia, obteve %d", len(mem.Pending()))
 	}
 }
 

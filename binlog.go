@@ -110,7 +110,7 @@ func (b *BinlogWatcher) Start(ctx context.Context) error {
 		defer mariadb.Close()
 	}
 
-	prod := producer.NewProducer(b.log, mariadb, b.enqueuer)
+	prod := producer.NewProducer(b.log, mariadb, b.db, b.cfg.ServerID, b.enqueuer)
 
 	const flushInterval = 5 * time.Second
 	lastFlush := time.Now()
@@ -151,7 +151,18 @@ func (b *BinlogWatcher) Start(ctx context.Context) error {
 			}
 
 			// NÃO reordenar: HandleEvent recebe a posição PRÉ-mutação (usada em generateEventID)
-			prod.HandleEvent(pos.Name, pos.Pos, ev)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						b.log.Error("Panic ao processar evento; evento descartado, watcher continua",
+							"recover", r, "binlog_file", pos.Name, "binlog_pos", pos.Pos)
+					}
+				}()
+				if err := prod.HandleEvent(pos.Name, pos.Pos, ev); err != nil {
+					b.log.Error("Erro ao processar evento; evento pode ter sido perdido",
+						"error", err, "binlog_file", pos.Name, "binlog_pos", pos.Pos)
+				}
+			}()
 			pos.Pos = ev.Header.LogPos
 
 			if time.Since(lastFlush) >= flushInterval {

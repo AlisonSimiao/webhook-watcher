@@ -24,10 +24,14 @@ func (s *UpdateRowsStrategy) Handle(ctx *EventContext) error {
 
 		resourceID, ok := rowResourceID(newRow)
 		if !ok {
+			tipo := "linha vazia"
+			if len(newRow) > 0 {
+				tipo = fmt.Sprintf("%T", newRow[0])
+			}
 			s.log.Warn("Coluna 0 não é INT assinado; evento ignorado",
 				"tenant", schema,
 				"table", tableName,
-				"tipo", fmt.Sprintf("%T", newRow[0]))
+				"tipo", tipo)
 			return nil
 		}
 

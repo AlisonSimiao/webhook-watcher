@@ -36,11 +36,13 @@ type Producer struct {
 	enqueuer   queue.Enqueuer
 }
 
-func NewProducer(logger *slog.Logger, db *sql.DB, enqueuer queue.Enqueuer) *Producer {
+func NewProducer(logger *slog.Logger, mariaDB *sql.DB, sqliteDB *sql.DB, serverID string, enqueuer queue.Enqueuer) *Producer {
 	update := &UpdateRowsStrategy{
 		RowsStrategy: RowsStrategy{
 			log:        logger,
-			db:         db,
+			db:         mariaDB,
+			sqliteDB:   sqliteDB,
+			serverID:   serverID,
 			enqueuer:   enqueuer,
 			processors: defaultProcessors(),
 		},
@@ -52,7 +54,7 @@ func NewProducer(logger *slog.Logger, db *sql.DB, enqueuer queue.Enqueuer) *Prod
 			replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1: update,
 		},
 		log:      logger,
-		db:       db,
+		db:       mariaDB,
 		enqueuer: enqueuer,
 	}
 }

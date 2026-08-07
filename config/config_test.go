@@ -126,3 +126,30 @@ func TestUpdateBinlogPosition_PersistsAndReloads(t *testing.T) {
 		t.Fatalf("posição não persistiu corretamente: got %q/%d", servers[0].BinlogFile, servers[0].BinlogPos)
 	}
 }
+
+func TestSaveFailedEvent_PersistsAndIsQueryable(t *testing.T) {
+	db, err := InitDB(filepath.Join(t.TempDir(), "servers.db"))
+	if err != nil {
+		t.Fatalf("InitDB falhou: %v", err)
+	}
+	defer db.Close()
+
+	if err := SaveFailedEvent(db, "DB01", "evt_abc123", "meu_tenant", "pedidos", "UPDATE", []byte(`{"id":42}`), "erro ao enfileirar: conexão recusada"); err != nil {
+		t.Fatalf("SaveFailedEvent falhou: %v", err)
+	}
+
+	row := db.QueryRow(`SELECT event_id, server_id, tenant, table_name, action, payload, error FROM failed_events WHERE event_id = ?`, "evt_abc123")
+	var eventID, serverID, tenant, table, action, payload, errMsg string
+	if err := row.Scan(&eventID, &serverID, &tenant, &table, &action, &payload, &errMsg); err != nil {
+		t.Fatalf("erro ao ler evento salvo: %v", err)
+	}
+	if eventID != "evt_abc123" || serverID != "DB01" || tenant != "meu_tenant" || table != "pedidos" || action != "UPDATE" {
+		t.Fatalf("dados persistidos incorretos: %s %s %s %s %s", eventID, serverID, tenant, table, action)
+	}
+	if payload != `{"id":42}` {
+		t.Fatalf("payload persistido incorreto: %s", payload)
+	}
+	if errMsg != "erro ao enfileirar: conexão recusada" {
+		t.Fatalf("mensagem de erro persistida incorreta: %s", errMsg)
+	}
+}

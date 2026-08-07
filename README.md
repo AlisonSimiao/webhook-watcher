@@ -36,6 +36,18 @@ filter msg like /binlog/
 
 O log `create BinlogSyncer` da go-mysql (config não serializável) é descartado pelo `dropMessageHandler`.
 
+## Eventos descartados (dead-letter)
+
+Se o enqueue no Redis falhar (ex: Redis indisponível), o evento é salvo na tabela `failed_events` do SQLite (`servers.db`) com o erro correspondente, em vez de ser perdido silenciosamente. Não há retry nem reprocessamento automático — a intervenção é manual:
+
+```bash
+go run . failed-events list                  # lista os mais recentes
+go run . failed-events list -server-id DB01  # filtra por servidor
+go run . failed-events remove -id 7          # remove após investigar
+```
+
+O payload completo não aparece no `list` (ficaria ilegível na tabela); para inspecioná-lo, consulte direto: `sqlite3 servers.db "SELECT payload FROM failed_events WHERE id = 7"`.
+
 ## System design
 
 Estado atual do projeto — o watcher é um binário Go único que replica o binlog do MariaDB, roteia os eventos para as estratégias registradas, enriquece as tabelas customizadas e **enfileira cada evento no Redis (asynq)**; o mesmo evento também é logado como JSON (CloudWatch). O consumer (montar webhook + HTTP) ainda não existe (ver [Próximos passos](#próximos-passos)).
@@ -229,7 +241,8 @@ docker build -f DockerFile -t webhook-watcher .
 ├── logging.go              # dropMessageHandler (filtra logs não serializáveis)
 ├── main.go                 # entrypoint (package main)
 ├── server_cmd.go           # subcomandos server add/list/update/remove
-├── config/config.go        # ServerConfig, InitDB (+ migração), LoadServersFromDB, UpdateBinlogPosition (SQLite)
+├── failed_events_cmd.go    # subcomandos failed-events list/remove (dead-letter)
+├── config/config.go        # ServerConfig, InitDB (+ migração), LoadServersFromDB, UpdateBinlogPosition, SaveFailedEvent (SQLite)
 ├── config/config_test.go   # testes de migração/persistência da posição do binlog
 ├── pkg/queue/queue.go      # port Enqueuer + envelope Event
 ├── pkg/queue/redis.go      # adapter RedisQueue (asynq, enqueue idempotente)
@@ -251,3 +264,4 @@ docker build -f DockerFile -t webhook-watcher .
   3. dispara o request HTTP com retry/backoff.
 - **Enriquecimento no consumer**: hoje o enriquecimento (queries no MariaDB) acontece no producer, antes do enqueue; mover para o consumer é opcional.
 - **Novos tipos de evento**: INSERT/DELETE (reutilizando `RowsStrategy` com stride/offset próprios, na mesma linha do UPDATE).
+- **Sharding de filas por recurso**: quando o consumer existir, considerar particionar a fila do Redis/asynq em N filas (`webhook-events-0`..`webhook-events-N`), escolhendo o shard por um hash de `tenant:table:resourceID` (não o `Event.ID` inteiro — este muda a cada evento, pois inclui `binlogFile`/`logPos`/`rowIndex`; usar só a parte que identifica o recurso, disponível em `producer/update.go` junto da geração do `Event.ID`). Isso garante que todo evento do mesmo recurso caia sempre no mesmo shard (preserva ordem), enquanto recursos diferentes podem ser processados em paralelo. Incluir o `tenant` na chave (não só `resourceID`) evita hot-shards, já que cada tenant é um schema com sua própria sequência de IDs. Importante: no asynq, só nomear filas diferentes não garante ordem — é necessário um consumer com concorrência 1 dedicado a cada shard (um `asynq.Server` por shard, ou equivalente), não um pool compartilhado de workers puxando de todas as filas.

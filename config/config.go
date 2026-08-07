@@ -86,6 +86,23 @@ CREATE TABLE IF NOT EXISTS binlog_servers (
 		return nil, err
 	}
 
+	const failedEventsSchema = `
+CREATE TABLE IF NOT EXISTS failed_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id   TEXT     NOT NULL,
+    server_id  TEXT     NOT NULL,
+    tenant     TEXT     NOT NULL,
+    table_name TEXT     NOT NULL,
+    action     TEXT     NOT NULL,
+    payload    TEXT     NOT NULL,
+    error      TEXT     NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`
+	if _, err := db.Exec(failedEventsSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("erro ao criar tabela failed_events: %w", err)
+	}
+
 	return db, nil
 }
 
@@ -170,6 +187,19 @@ func UpdateBinlogPosition(db *sql.DB, serverID string, binlogFile string, binlog
 	)
 	if err != nil {
 		return fmt.Errorf("erro ao persistir posição do binlog: %w", err)
+	}
+	return nil
+}
+
+// SaveFailedEvent persiste um evento que não conseguiu ser enfileirado, para
+// consulta e intervenção manual posterior (sem reprocessamento automático).
+func SaveFailedEvent(db *sql.DB, serverID, eventID, tenant, table, action string, payload []byte, errMsg string) error {
+	_, err := db.Exec(
+		`INSERT INTO failed_events (event_id, server_id, tenant, table_name, action, payload, error) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		eventID, serverID, tenant, table, action, string(payload), errMsg,
+	)
+	if err != nil {
+		return fmt.Errorf("erro ao salvar evento descartado: %w", err)
 	}
 	return nil
 }
