@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	github.com/go-mysql-org/go-mysql v1.16.0
+	github.com/hibiken/asynq v0.26.0
 	github.com/joho/godotenv v1.5.1
 	modernc.org/sqlite v1.55.0
 )
@@ -16,7 +17,6 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/hibiken/asynq v0.26.0 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect

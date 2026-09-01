@@ -53,12 +53,13 @@ func (s *UpdateRowsStrategy) Handle(ctx *EventContext) error {
 		}
 
 		event := &queue.Event{
-			ID:        generateEventID(ctx.BinlogFile, ctx.BinlogPos, rowIndex, schema, tableName, resourceID),
-			Tenant:    schema,
-			Table:     tableName,
-			Action:    queue.ActionUpdate,
-			Timestamp: int64(ctx.Event.Header.Timestamp),
-			Payload:   payload,
+			ID:         generateEventID(ctx.BinlogFile, ctx.BinlogPos, rowIndex, schema, tableName, resourceID),
+			Tenant:     schema,
+			Table:      tableName,
+			Action:     queue.ActionUpdate,
+			Timestamp:  int64(ctx.Event.Header.Timestamp),
+			ResourceID: resourceID,
+			Payload:    payload,
 		}
 		s.emit(ctx.Ctx, event)
 		return nil

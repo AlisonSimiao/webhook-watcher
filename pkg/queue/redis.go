@@ -27,12 +27,14 @@ var ErrDuplicate = asynq.ErrTaskIDConflict
 
 // RedisQueue é o adapter Redis (via asynq) do port Enqueuer.
 type RedisQueue struct {
-	client *asynq.Client
+	client    *asynq.Client
+	queueName string
 }
 
-// NewRedisQueue cria o adapter Redis. addr é "host:port" do Redis.
-func NewRedisQueue(addr string) *RedisQueue {
-	return &RedisQueue{client: asynq.NewClient(asynq.RedisClientOpt{Addr: addr})}
+// NewRedisQueue cria o adapter Redis. addr é "host:port" do Redis; queueName é
+// o nome da fila asynq (ex: QueueNameHTTP ou QueueNameHTTPShard(i)).
+func NewRedisQueue(addr, queueName string) *RedisQueue {
+	return &RedisQueue{client: asynq.NewClient(asynq.RedisClientOpt{Addr: addr}), queueName: queueName}
 }
 
 // Enqueue publica o evento na fila. O Event.ID vira o TaskID do asynq, o que
@@ -47,7 +49,7 @@ func (q *RedisQueue) Enqueue(ctx context.Context, event *Event) error {
 	task := asynq.NewTask(taskTypeEvent, payload,
 		asynq.MaxRetry(defaultMaxRetries),
 		asynq.Timeout(defaultTaskTimeout),
-		asynq.Queue(QueueName),
+		asynq.Queue(q.queueName),
 	)
 	if _, err := q.client.EnqueueContext(ctx, task, asynq.TaskID(event.ID)); err != nil {
 		return fmt.Errorf("erro ao enfileirar evento %s: %w", event.ID, err)
