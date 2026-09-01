@@ -35,9 +35,6 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "failed-deliveries" {
 		os.Exit(runFailedDeliveriesCommand(os.Args[2:]))
 	}
-	if len(os.Args) > 1 && os.Args[1] == "hub" {
-		os.Exit(runHubCommand(os.Args[2:]))
-	}
 	if len(os.Args) > 1 && os.Args[1] == "consumer" {
 		os.Exit(runConsumerCommand(os.Args[2:]))
 	}

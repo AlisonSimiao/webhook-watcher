@@ -2,22 +2,16 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
 
-	"webhook-watcher/config"
 	"webhook-watcher/consumer/webhook"
 	"webhook-watcher/pkg/queue"
 )
-
-const hookCacheRefreshInterval = 5 * time.Minute
 
 // runConsumerCommand despacha os subcomandos "consumer <tipo>". Hoje só
 // "http" existe; um novo tipo de consumer (sse, notify) entraria aqui como
@@ -42,9 +36,15 @@ func consumerUsage() {
 	fmt.Println(`Uso: webhook-watcher consumer <tipo>
 
 Tipos:
-  http    Consome webhook-events.http.* e entrega via HTTP POST`)
+  http    Consome webhook-events.http.* e repassa para o srp-hub-api
+          (/interno/hooks/<tipo>), que faz a entrega ao cliente final`)
 }
 
+// runHTTPConsumer repassa cada evento para o srp-hub-api
+// (POST <SRP_HUB_API_BASE_URL>/interno/hooks/<tipo>), que já resolve os
+// destinos de webhook por cliente (clientes_hooks/cliente) e faz o fan-out —
+// este consumer não lê mais aquelas tabelas nem precisa de conexão própria
+// com o MariaDB do hub.
 func runHTTPConsumer(args []string) int {
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisAddr == "" {
@@ -52,17 +52,17 @@ func runHTTPConsumer(args []string) int {
 		return 1
 	}
 
+	baseURL := os.Getenv("SRP_HUB_API_BASE_URL")
+	token := os.Getenv("SRP_HUB_API_TOKEN")
+	if baseURL == "" || token == "" {
+		slog.Error("SRP_HUB_API_BASE_URL e/ou SRP_HUB_API_TOKEN não definidas")
+		return 1
+	}
+
 	shardCount := httpShardCount()
 
 	sqliteDB := openDB()
 	defer sqliteDB.Close()
-
-	hubDB, err := openHubDB(sqliteDB)
-	if err != nil {
-		slog.Error("Erro ao conectar no hub", "error", err)
-		return 1
-	}
-	defer hubDB.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
@@ -73,10 +73,7 @@ func runHTTPConsumer(args []string) int {
 		cancel()
 	}()
 
-	cache := webhook.NewHookCache(hubDB, sqliteDB, slog.Default())
-	go cache.StartRefreshLoop(ctx, hookCacheRefreshInterval)
-
-	delivery := webhook.NewDelivery(cache, sqliteDB, slog.Default())
+	delivery := webhook.NewDelivery(baseURL, token, sqliteDB, slog.Default())
 
 	var wg sync.WaitGroup
 	for i := 0; i < shardCount; i++ {
@@ -96,35 +93,7 @@ func runHTTPConsumer(args []string) int {
 		}(i)
 	}
 
-	slog.Info("Consumer HTTP iniciado", "shards", shardCount)
+	slog.Info("Consumer HTTP iniciado", "shards", shardCount, "srp_hub_api_base_url", baseURL)
 	wg.Wait()
 	return 0
-}
-
-// openHubDB conecta na schema fixa hub_<ambiente> configurada via
-// "go run . hub set" — credenciais próprias, distintas do registro de
-// replicação em binlog_servers (SQLite), pois é uma conexão de leitura de
-// dados de negócio, não de binlog.
-func openHubDB(sqliteDB *sql.DB) (*sql.DB, error) {
-	cfg, err := config.LoadHubConfig(sqliteDB)
-	if errors.Is(err, config.ErrHubConfigNotSet) {
-		return nil, fmt.Errorf("%w (rode 'go run . hub set')", err)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.SchemaName)
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("erro ao abrir conexão com o hub: %w", err)
-	}
-
-	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := db.PingContext(pingCtx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("erro ao conectar no hub (%s@%s:%d/%s): %w", cfg.User, cfg.Host, cfg.Port, cfg.SchemaName, err)
-	}
-	return db, nil
 }

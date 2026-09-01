@@ -3,7 +3,6 @@ package config
 import (
 	"database/sql"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -179,63 +178,5 @@ func TestSaveFailedDelivery_PersistsAndIsQueryable(t *testing.T) {
 	}
 	if errMsg != "resposta não-2xx: 500" {
 		t.Fatalf("mensagem de erro persistida incorreta: %s", errMsg)
-	}
-}
-
-func TestHubConfig_SaveAndLoad(t *testing.T) {
-	db, err := InitDB(filepath.Join(t.TempDir(), "servers.db"))
-	if err != nil {
-		t.Fatalf("InitDB falhou: %v", err)
-	}
-	defer db.Close()
-
-	if _, err := LoadHubConfig(db); err != ErrHubConfigNotSet {
-		t.Fatalf("esperava ErrHubConfigNotSet antes de qualquer hub set, obteve %v", err)
-	}
-
-	if err := SaveHubConfig(db, "db.multiplier.local", 3306, "root", "kodejifr", "hub_development", ""); err != nil {
-		t.Fatalf("SaveHubConfig falhou: %v", err)
-	}
-
-	cfg, err := LoadHubConfig(db)
-	if err != nil {
-		t.Fatalf("LoadHubConfig falhou: %v", err)
-	}
-	if cfg.Host != "db.multiplier.local" || cfg.Port != 3306 || cfg.User != "root" || cfg.Password != "kodejifr" || cfg.SchemaName != "hub_development" {
-		t.Fatalf("configuração carregada incorreta: %+v", cfg)
-	}
-	if cfg.HookQuery != DefaultHookQuery {
-		t.Fatalf("esperava DefaultHookQuery quando query vazia foi passada, obteve: %s", cfg.HookQuery)
-	}
-
-	if err := SaveHubConfig(db, "outro.host", 3307, "user2", "pass2", "hub_producao", "SELECT 1"); err != nil {
-		t.Fatalf("segundo SaveHubConfig (update) falhou: %v", err)
-	}
-
-	cfg2, err := LoadHubConfig(db)
-	if err != nil {
-		t.Fatalf("LoadHubConfig após update falhou: %v", err)
-	}
-	if cfg2.ID != cfg.ID {
-		t.Fatalf("esperava upsert (mesma linha, id %d), obteve nova linha id %d", cfg.ID, cfg2.ID)
-	}
-	if cfg2.Host != "outro.host" || cfg2.SchemaName != "hub_producao" || cfg2.HookQuery != "SELECT 1" {
-		t.Fatalf("configuração não atualizou corretamente: %+v", cfg2)
-	}
-
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM hub_config`).Scan(&count); err != nil {
-		t.Fatalf("erro ao contar linhas de hub_config: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("esperava exatamente 1 linha em hub_config (upsert), obteve %d", count)
-	}
-}
-
-func TestDefaultHookQuery_HasExpectedFilters(t *testing.T) {
-	for _, want := range []string{"deleted_at IS NULL", "status = 1", "id_cliente_hub", "AS tenant", "AS tipo", "AS url"} {
-		if !strings.Contains(DefaultHookQuery, want) {
-			t.Fatalf("DefaultHookQuery não contém %q:\n%s", want, DefaultHookQuery)
-		}
 	}
 }

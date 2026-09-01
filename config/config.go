@@ -2,7 +2,6 @@ package config
 
 import (
 	"database/sql"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -123,22 +122,6 @@ CREATE TABLE IF NOT EXISTS failed_deliveries (
 		return nil, fmt.Errorf("erro ao criar tabela failed_deliveries: %w", err)
 	}
 
-	const hubConfigSchema = `
-CREATE TABLE IF NOT EXISTS hub_config (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    host        TEXT    NOT NULL,
-    port        INTEGER NOT NULL DEFAULT 3306,
-    user        TEXT    NOT NULL,
-    password    TEXT    NOT NULL,
-    schema_name TEXT    NOT NULL,
-    hook_query  TEXT    NOT NULL,
-    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-);`
-	if _, err := db.Exec(hubConfigSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("erro ao criar tabela hub_config: %w", err)
-	}
-
 	return db, nil
 }
 
@@ -255,78 +238,4 @@ func SaveFailedDelivery(db *sql.DB, eventID, tenant, table, action, url string, 
 		return fmt.Errorf("erro ao salvar entrega descartada: %w", err)
 	}
 	return nil
-}
-
-// DefaultHookQuery é a query padrão de resolução de destino de webhook,
-// gravada por "hub set" quando nenhuma query é informada via -query. Faz o
-// join clientes_hooks -> cliente (a FK real de id_cliente_hub aponta para
-// cliente.id, não para uma tabela cliente_hub) e devolve tenant/tipo/url com
-// aliases explícitos — importante para o comando de diagnóstico "hub query"
-// conseguir checar os nomes de coluna independente de como a query interna
-// nomeia as tabelas.
-const DefaultHookQuery = `SELECT c.tenant AS tenant, h.tipo AS tipo, h.url AS url
-FROM clientes_hooks h
-JOIN cliente c ON c.id = h.id_cliente_hub
-WHERE h.deleted_at IS NULL
-  AND c.status = 1`
-
-// HubConfig descreve a conexão com o MariaDB do hub (schema fixo
-// hub_<ambiente>, usado para resolver destinos de webhook) e a query usada
-// para buscar esses destinos.
-type HubConfig struct {
-	ID         uint64
-	Host       string
-	Port       uint16
-	User       string
-	Password   string
-	SchemaName string
-	HookQuery  string
-}
-
-// ErrHubConfigNotSet indica que "hub set" ainda não foi rodado.
-var ErrHubConfigNotSet = errors.New("hub_config não configurado; rode 'go run . hub set' primeiro")
-
-// SaveHubConfig grava a configuração do hub (upsert: atualiza a única linha
-// existente, ou insere a primeira). Se query for vazio, grava
-// DefaultHookQuery.
-func SaveHubConfig(db *sql.DB, host string, port int, user, password, schemaName, query string) error {
-	if query == "" {
-		query = DefaultHookQuery
-	}
-
-	var existingID uint64
-	err := db.QueryRow(`SELECT id FROM hub_config ORDER BY id LIMIT 1`).Scan(&existingID)
-	switch {
-	case err == sql.ErrNoRows:
-		_, err = db.Exec(
-			`INSERT INTO hub_config (host, port, user, password, schema_name, hook_query) VALUES (?, ?, ?, ?, ?, ?)`,
-			host, port, user, password, schemaName, query,
-		)
-	case err == nil:
-		_, err = db.Exec(
-			`UPDATE hub_config SET host = ?, port = ?, user = ?, password = ?, schema_name = ?, hook_query = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-			host, port, user, password, schemaName, query, existingID,
-		)
-	}
-	if err != nil {
-		return fmt.Errorf("erro ao salvar configuração do hub: %w", err)
-	}
-	return nil
-}
-
-// LoadHubConfig lê a configuração única do hub. Devolve ErrHubConfigNotSet se
-// "hub set" ainda não foi rodado.
-func LoadHubConfig(db *sql.DB) (HubConfig, error) {
-	var c HubConfig
-	var port int
-	row := db.QueryRow(`SELECT id, host, port, user, password, schema_name, hook_query FROM hub_config ORDER BY id LIMIT 1`)
-	err := row.Scan(&c.ID, &c.Host, &port, &c.User, &c.Password, &c.SchemaName, &c.HookQuery)
-	if err == sql.ErrNoRows {
-		return HubConfig{}, ErrHubConfigNotSet
-	}
-	if err != nil {
-		return HubConfig{}, fmt.Errorf("erro ao carregar configuração do hub: %w", err)
-	}
-	c.Port = uint16(port)
-	return c, nil
 }

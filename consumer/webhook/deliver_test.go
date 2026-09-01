@@ -2,8 +2,8 @@ package webhook
 
 import (
 	"context"
-	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -14,27 +14,20 @@ import (
 	"webhook-watcher/pkg/queue"
 )
 
-func cacheWithURLs(tenant, table string, urls ...string) *HookCache {
-	c := NewHookCache(nil, nil, testLogger())
-	tipo, ok := tableToTipo[table]
-	if !ok {
-		panic("tabela sem tradução conhecida em teste: " + table)
-	}
-	c.dest[destKey{tenant: tenant, tipo: tipo}] = urls
-	return c
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func TestDelivery_Handle_NoDestinationsIsNoop(t *testing.T) {
+func TestDelivery_Handle_UnknownTableIsNoop(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
 	}))
 	defer srv.Close()
 
-	cache := NewHookCache(nil, nil, testLogger()) // sem destinos cadastrados
-	d := NewDelivery(cache, nil, testLogger())
+	d := NewDelivery(srv.URL, "token", nil, testLogger())
 
-	event := &queue.Event{ID: "evt_1", Tenant: "semhook", Table: "pedidos"}
+	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "clientes"} // "clientes" não está em tableToTipo
 	if err := d.Handle(context.Background(), event); err != nil {
 		t.Fatalf("esperava nil, obteve %v", err)
 	}
@@ -43,95 +36,95 @@ func TestDelivery_Handle_NoDestinationsIsNoop(t *testing.T) {
 	}
 }
 
-func TestDelivery_Handle_PostsToAllConfiguredURLs(t *testing.T) {
-	var received1, received2 []byte
-	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		received1, _ = io.ReadAll(r.Body)
-		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
-			t.Errorf("Content-Type inesperado: %s", ct)
-		}
+func TestDelivery_Handle_PostsPayloadToInternoHooksTipo(t *testing.T) {
+	var gotPath, gotAuth, gotTenant, gotContentType string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotTenant = r.Header.Get("tenant")
+		gotContentType = r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer srv1.Close()
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		received2, _ = io.ReadAll(r.Body)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv2.Close()
+	defer srv.Close()
 
-	cache := cacheWithURLs("acme", "pedidos", srv1.URL, srv2.URL)
-	d := NewDelivery(cache, nil, testLogger())
+	d := NewDelivery(srv.URL, "srp-token-xyz", nil, testLogger())
 
-	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos", Action: queue.ActionUpdate}
+	payload := []byte(`{"tipoModificacao":"M","recurso":{"id":42}}`)
+	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos", Action: queue.ActionUpdate, Payload: payload}
 	if err := d.Handle(context.Background(), event); err != nil {
 		t.Fatalf("esperava nil, obteve %v", err)
 	}
 
-	for _, body := range [][]byte{received1, received2} {
-		var got queue.Event
-		if err := json.Unmarshal(body, &got); err != nil {
-			t.Fatalf("corpo recebido não é um queue.Event válido: %v", err)
-		}
-		if got.ID != "evt_1" || got.Tenant != "acme" {
-			t.Fatalf("evento recebido incorreto: %+v", got)
-		}
+	if gotPath != "/interno/hooks/pedidos" {
+		t.Fatalf("path inesperado: %s", gotPath)
+	}
+	if gotAuth != "srp-token-xyz" {
+		t.Fatalf("header Authorization inesperado: %q (não deve ter prefixo Bearer)", gotAuth)
+	}
+	if gotTenant != "acme" {
+		t.Fatalf("header tenant inesperado: %q", gotTenant)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("Content-Type inesperado: %q", gotContentType)
+	}
+	if string(gotBody) != string(payload) {
+		t.Fatalf("corpo enviado incorreto: esperava %s, obteve %s (deve ser Event.Payload cru, sem re-envelopar)", payload, gotBody)
+	}
+}
+
+func TestDelivery_Handle_BaseURLTrailingSlashIsTrimmed(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d := NewDelivery(srv.URL+"/", "token", nil, testLogger())
+
+	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos", Payload: []byte(`{}`)}
+	if err := d.Handle(context.Background(), event); err != nil {
+		t.Fatalf("esperava nil, obteve %v", err)
+	}
+	if gotPath != "/interno/hooks/pedidos" {
+		t.Fatalf("path com barra dupla: %s", gotPath)
 	}
 }
 
 func TestDelivery_Handle_NonSuccessStatusReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer srv.Close()
 
-	cache := cacheWithURLs("acme", "pedidos", srv.URL)
-	d := NewDelivery(cache, nil, testLogger())
+	d := NewDelivery(srv.URL, "token-errado", nil, testLogger())
 
-	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos"}
+	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos", Payload: []byte(`{}`)}
 	if err := d.Handle(context.Background(), event); err == nil {
-		t.Fatal("esperava erro para resposta 500, obteve nil")
+		t.Fatal("esperava erro para resposta 401, obteve nil")
 	}
 }
 
 func TestDelivery_Handle_TransportErrorReturnsError(t *testing.T) {
-	// Servidor fechado imediatamente: URL válida, mas conexão recusada.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	url := srv.URL
-	srv.Close()
+	srv.Close() // conexão recusada
 
-	cache := cacheWithURLs("acme", "pedidos", url)
-	d := NewDelivery(cache, nil, testLogger())
+	d := NewDelivery(url, "token", nil, testLogger())
 
-	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos"}
+	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos", Payload: []byte(`{}`)}
 	if err := d.Handle(context.Background(), event); err == nil {
 		t.Fatal("esperava erro de transporte, obteve nil")
 	}
 }
 
-func TestDelivery_Handle_PartialFailureAmongMultipleDestinationsStillErrors(t *testing.T) {
-	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ok.Close()
-	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer fail.Close()
-
-	cache := cacheWithURLs("acme", "pedidos", ok.URL, fail.URL)
-	d := NewDelivery(cache, nil, testLogger())
-
-	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos"}
-	if err := d.Handle(context.Background(), event); err == nil {
-		t.Fatal("esperava erro quando ao menos um destino falha, obteve nil")
-	}
-}
-
 func TestDelivery_Handle_FailedDeliveriesOnlyPersistedOnLastAttempt(t *testing.T) {
-	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
-	defer fail.Close()
+	defer srv.Close()
 
 	db, err := config.InitDB(filepath.Join(t.TempDir(), "servers.db"))
 	if err != nil {
@@ -139,10 +132,9 @@ func TestDelivery_Handle_FailedDeliveriesOnlyPersistedOnLastAttempt(t *testing.T
 	}
 	defer db.Close()
 
-	cache := cacheWithURLs("acme", "pedidos", fail.URL)
-	d := NewDelivery(cache, db, testLogger())
+	d := NewDelivery(srv.URL, "token", db, testLogger())
 
-	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos"}
+	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos", Payload: []byte(`{}`)}
 	// context.Background() não carrega metadados de task do asynq, então
 	// isLastAttempt(ctx) é sempre false aqui — equivalente a "não é a última
 	// tentativa" (o asynq só popula esses metadados dentro de um worker real).
