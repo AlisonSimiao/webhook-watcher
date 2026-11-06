@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"webhook-watcher/consumer/webhook"
@@ -75,6 +76,19 @@ func runHTTPConsumer(args []string) int {
 
 	delivery := webhook.NewDelivery(baseURL, token, sqliteDB, slog.Default())
 
+	// Saudável = todos os workers de shard subiram; um shard que falha ao
+	// iniciar deixaria parte dos recursos sem consumo, sem nenhum outro sinal.
+	var shardsUp atomic.Int32
+	redisPing := newRedisPinger()
+	defer redisPing.Close()
+	startHealthServer(healthAddr(defaultConsumerHealthAddr), func() (bool, map[string]any) {
+		up := int(shardsUp.Load())
+		return up == shardCount, map[string]any{
+			"shards": fmt.Sprintf("%d/%d", up, shardCount),
+			"redis":  redisStatus(redisPing.Ping),
+		}
+	})
+
 	var wg sync.WaitGroup
 	for i := 0; i < shardCount; i++ {
 		wg.Add(1)
@@ -87,6 +101,7 @@ func runHTTPConsumer(args []string) int {
 				slog.Error("Erro ao iniciar worker de shard", "fila", queueName, "error", err)
 				return
 			}
+			shardsUp.Add(1)
 			slog.Info("Consumer HTTP: shard iniciado", "fila", queueName)
 			<-ctx.Done()
 			worker.Shutdown()

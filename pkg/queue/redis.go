@@ -57,6 +57,11 @@ func (q *RedisQueue) Enqueue(ctx context.Context, event *Event) error {
 	return nil
 }
 
+// Ping verifica a conexão com o Redis (usado pelo /healthz).
+func (q *RedisQueue) Ping() error {
+	return q.client.Ping()
+}
+
 // Close encerra a conexão com o Redis.
 func (q *RedisQueue) Close() error {
 	return q.client.Close()

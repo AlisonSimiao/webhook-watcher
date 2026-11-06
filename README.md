@@ -37,6 +37,19 @@ filter msg like /binlog/
 
 O log `create BinlogSyncer` da go-mysql (config não serializável) é descartado pelo `dropMessageHandler`.
 
+## Health check (`/healthz`)
+
+Producer e consumer expõem `GET /healthz` (JSON; `200` saudável, `503` não), em `HEALTH_ADDR` — padrão `:8090` no producer e `:8091` no consumer, para os dois rodarem na mesma máquina:
+
+```bash
+curl localhost:8090/healthz   # {"status":"ok","watchers":{"DB01":"ok"},"redis":"ok"}
+curl localhost:8091/healthz   # {"status":"ok","shards":"16/16","redis":"ok"}
+```
+
+- **Producer**: `503` se algum watcher de binlog encerrou (erro/panic) ou ficou mais de 30s sem girar o loop (travado). Com vários servidores, um watcher morto não derruba o processo — é o `503` que faz o orquestrador reiniciá-lo. Se **todos** os watchers encerram sem SIGINT/SIGTERM, o processo sai com código `1`.
+- **Consumer**: `503` se algum worker de shard não subiu.
+- O campo `redis` é só informativo: Redis fora do ar **não** gera `503`, porque reiniciar o processo não resolve (o producer já cai em `failed_events` e o asynq do consumer reconecta sozinho).
+
 ## Eventos descartados (dead-letter)
 
 Dois pontos de dead-letter simétricos, um por lado do pipeline — nenhum evento é perdido silenciosamente, mas também não há retry/reprocessamento automático em nenhum dos dois; a intervenção é manual em ambos.
@@ -278,6 +291,7 @@ docker run -d --name consumer --env-file .env -v watcher-data:/data webhook-watc
 ├── binlog.go               # watcher de binlog (package main)
 ├── binlog_test.go          # testes de decideStartPosition (resume vs. 1ª execução)
 ├── docker-compose.yaml     # Redis + asynqmon (infra local de dev)
+├── health.go               # /healthz (liveness dos watchers / shards do consumer)
 ├── logging.go              # dropMessageHandler (filtra logs não serializáveis)
 ├── main.go                 # entrypoint (package main), initQueue() monta FanoutQueue+ShardedQueue
 ├── server_cmd.go           # subcomandos server add/list/update/remove + openDB/httpShardCount

@@ -81,22 +81,41 @@ func main() {
 		cancel()
 	}()
 
+	live := newWatcherLiveness()
+	for _, s := range servers {
+		live.beat(s.ServerID)
+	}
+	redisPing := newRedisPinger()
+	defer redisPing.Close()
+	startHealthServer(healthAddr(defaultProducerHealthAddr), func() (bool, map[string]any) {
+		healthy, watchers := live.check()
+		return healthy, map[string]any{"watchers": watchers, "redis": redisStatus(redisPing.Ping)}
+	})
+
 	var wg sync.WaitGroup
 	for _, s := range servers {
 		wg.Add(1)
 		go func(cfg config.ServerConfig) {
 			defer wg.Done()
+			defer live.stop(cfg.ServerID)
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("Panic no watcher; servidor encerrado, demais continuam", "server_id", cfg.ServerID, "recover", r)
 				}
 			}()
-			if err := newBinlogWatcher(cfg, slog.Default(), enqueuer, db).Start(ctx); err != nil {
+			if err := newBinlogWatcher(cfg, slog.Default(), enqueuer, db, func() { live.beat(cfg.ServerID) }).Start(ctx); err != nil {
 				slog.Error("Servidor encerrado com erro", "server_id", cfg.ServerID, "error", err)
 			}
 		}(s)
 	}
 	wg.Wait()
+
+	// Todos os watchers acabaram sem SIGINT/SIGTERM: é falha, não encerramento
+	// normal — sai com código != 0 para o orquestrador reiniciar.
+	if ctx.Err() == nil {
+		slog.Error("Todos os watchers encerraram; finalizando com erro")
+		os.Exit(1)
+	}
 }
 
 // initQueue cria o Enqueuer da produção (binlog → fila). Publica em fan-out
@@ -126,4 +145,10 @@ func initQueue() queue.Enqueuer {
 		// queue.NewRedisQueue(addr, queue.QueueNameNotify), // futuro
 	}
 	return queue.NewFanoutQueue(targets...)
+}
+
+// newRedisPinger abre um client só para o /healthz consultar o Redis, sem
+// expor Ping no port Enqueuer (o producer não deve conhecer o Redis).
+func newRedisPinger() *queue.RedisQueue {
+	return queue.NewRedisQueue(os.Getenv("REDIS_ADDR"), queue.QueueNameHTTP)
 }

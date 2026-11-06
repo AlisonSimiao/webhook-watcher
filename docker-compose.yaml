@@ -5,7 +5,7 @@
 # (o MariaDB é externo e configurado no .env / binlog_servers)
 #
 # Teste local sem o srp-hub-api: docker compose --profile dump up -d sobe
-# também um receptor HTTP falso no lugar dele na porta 8090 (os corpos
+# também um receptor HTTP falso no lugar dele na porta 8092 (os corpos
 # recebidos aparecem em: docker compose logs -f hub-api-fake).
 services:
   redis:
@@ -42,7 +42,7 @@ services:
     profiles: ["dump"]
     restart: unless-stopped
     ports:
-      - "8090:8080"
+      - "8092:8080"
 
 volumes:
   redis-data:
