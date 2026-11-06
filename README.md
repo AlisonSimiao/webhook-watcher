@@ -257,10 +257,17 @@ go run . consumer http
 
 ### Docker
 
-O `DockerFile` usa o estágio builder com `go build -o webhook-watcher .` e produz uma imagem `alpine` final enxuta:
+O `Dockerfile` usa o estágio builder com `go build -o webhook-watcher .` e produz uma imagem `alpine` final enxuta:
 
 ```bash
-docker build -f DockerFile -t webhook-watcher .
+docker build -t webhook-watcher .
+```
+
+O `ENTRYPOINT` é o próprio binário, então o mesmo container roda o producer (sem argumentos) ou o consumer (`consumer http`). O `servers.db` fica em `/data` (`SQLITE_PATH=/data/servers.db`) — monte um volume persistente ali, compartilhado entre producer e consumer; sem ele, cada restart perde a posição do binlog:
+
+```bash
+docker run -d --name watcher  --env-file .env -v watcher-data:/data webhook-watcher
+docker run -d --name consumer --env-file .env -v watcher-data:/data webhook-watcher consumer http
 ```
 
 ## Estrutura do projeto
