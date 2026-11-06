@@ -32,6 +32,12 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "failed-events" {
 		os.Exit(runFailedEventsCommand(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "failed-deliveries" {
+		os.Exit(runFailedDeliveriesCommand(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "consumer" {
+		os.Exit(runConsumerCommand(os.Args[2:]))
+	}
 
 	enqueuer := initQueue()
 	defer enqueuer.Close()
@@ -75,25 +81,50 @@ func main() {
 		cancel()
 	}()
 
+	live := newWatcherLiveness()
+	for _, s := range servers {
+		live.beat(s.ServerID)
+	}
+	redisPing := newRedisPinger()
+	defer redisPing.Close()
+	startHealthServer(healthAddr(defaultProducerHealthAddr), func() (bool, map[string]any) {
+		healthy, watchers := live.check()
+		return healthy, map[string]any{"watchers": watchers, "redis": redisStatus(redisPing.Ping)}
+	})
+
 	var wg sync.WaitGroup
 	for _, s := range servers {
 		wg.Add(1)
 		go func(cfg config.ServerConfig) {
 			defer wg.Done()
+			defer live.stop(cfg.ServerID)
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("Panic no watcher; servidor encerrado, demais continuam", "server_id", cfg.ServerID, "recover", r)
 				}
 			}()
-			if err := newBinlogWatcher(cfg, slog.Default(), enqueuer, db).Start(ctx); err != nil {
+			if err := newBinlogWatcher(cfg, slog.Default(), enqueuer, db, func() { live.beat(cfg.ServerID) }).Start(ctx); err != nil {
 				slog.Error("Servidor encerrado com erro", "server_id", cfg.ServerID, "error", err)
 			}
 		}(s)
 	}
 	wg.Wait()
+
+	// Todos os watchers acabaram sem SIGINT/SIGTERM: é falha, não encerramento
+	// normal — sai com código != 0 para o orquestrador reiniciar.
+	if ctx.Err() == nil {
+		slog.Error("Todos os watchers encerraram; finalizando com erro")
+		os.Exit(1)
+	}
 }
 
-// initQueue cria o adapter da fila de eventos. O Redis é obrigatório (subido via
+// initQueue cria o Enqueuer da produção (binlog → fila). Publica em fan-out
+// para uma fila por tipo de consumer — hoje só webhook-events.http, com
+// sharding por recurso (tenant:table:resourceID) para preservar ordem de
+// entrega. Para adicionar um novo tipo de consumer no futuro (SSE,
+// notificações), construa seu queue.NewRedisQueue(addr, queue.QueueNameX) e
+// acrescente-o à lista de targets abaixo; nenhuma outra mudança é
+// necessária no producer. O Redis é obrigatório (subido via
 // docker compose up -d); sem REDIS_ADDR o watcher falha na inicialização.
 func initQueue() queue.Enqueuer {
 	addr := os.Getenv("REDIS_ADDR")
@@ -101,5 +132,23 @@ func initQueue() queue.Enqueuer {
 		slog.Error("REDIS_ADDR não definida; suba o Redis com 'docker compose up -d'")
 		os.Exit(1)
 	}
-	return queue.NewRedisQueue(addr)
+
+	shardCount := httpShardCount()
+	shards := make([]queue.Enqueuer, shardCount)
+	for i := range shards {
+		shards[i] = queue.NewRedisQueue(addr, queue.QueueNameHTTPShard(i))
+	}
+
+	targets := []queue.Enqueuer{
+		queue.NewShardedQueue(shards...),
+		// queue.NewRedisQueue(addr, queue.QueueNameSSE),    // futuro (sem sharding, se não exigir ordem)
+		// queue.NewRedisQueue(addr, queue.QueueNameNotify), // futuro
+	}
+	return queue.NewFanoutQueue(targets...)
+}
+
+// newRedisPinger abre um client só para o /healthz consultar o Redis, sem
+// expor Ping no port Enqueuer (o producer não deve conhecer o Redis).
+func newRedisPinger() *queue.RedisQueue {
+	return queue.NewRedisQueue(os.Getenv("REDIS_ADDR"), queue.QueueNameHTTP)
 }

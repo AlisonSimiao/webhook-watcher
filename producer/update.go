@@ -35,8 +35,13 @@ func (s *UpdateRowsStrategy) Handle(ctx *EventContext) error {
 			return nil
 		}
 
+		// A dataEvento é lida antes do Process, que é quem lê o estado do
+		// Recurso no MariaDB (enriquecimento): o snapshot é no máximo tão novo
+		// quanto ela, nunca mais antigo.
+		dataEvento := s.dataEvento()
+
 		// Apenas tabelas com TableProcessor registrado geram eventos.
-		res, handled, err := s.dispatchTable(schema, tableName, string(queue.ActionUpdate), newRow, nil)
+		tipo, recurso, handled, err := s.dispatchTable(schema, tableName, string(queue.ActionUpdate), newRow, nil)
 		if err != nil {
 			s.log.Error("Erro ao processar tabela com TableProcessor", "tabela", tableName, "error", err)
 			return err
@@ -46,19 +51,33 @@ func (s *UpdateRowsStrategy) Handle(ctx *EventContext) error {
 			return nil
 		}
 
-		payload, err := json.Marshal(res)
+		recursoJSON, err := json.Marshal(recurso)
+		if err != nil {
+			s.log.Error("Erro ao serializar recurso do evento", "tabela", tableName, "error", err)
+			return err
+		}
+
+		id := generateEventID(ctx.BinlogFile, ctx.BinlogPos, rowIndex, schema, tableName, resourceID)
+		payload, err := json.Marshal(queue.Contrato{
+			IDEvento:        id,
+			Tipo:            tipo,
+			TipoModificacao: queue.TipoModificacaoDe(queue.ActionUpdate),
+			DataEvento:      dataEvento,
+			Tenant:          schema,
+			Recurso:         recursoJSON,
+		})
 		if err != nil {
 			s.log.Error("Erro ao serializar payload do evento", "tabela", tableName, "error", err)
 			return err
 		}
 
 		event := &queue.Event{
-			ID:        generateEventID(ctx.BinlogFile, ctx.BinlogPos, rowIndex, schema, tableName, resourceID),
-			Tenant:    schema,
-			Table:     tableName,
-			Action:    queue.ActionUpdate,
-			Timestamp: int64(ctx.Event.Header.Timestamp),
-			Payload:   payload,
+			ID:         id,
+			Tenant:     schema,
+			Table:      tableName,
+			Action:     queue.ActionUpdate,
+			ResourceID: resourceID,
+			Payload:    payload,
 		}
 		s.emit(ctx.Ctx, event)
 		return nil

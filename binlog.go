@@ -18,14 +18,18 @@ import (
 )
 
 type BinlogWatcher struct {
-	cfg      config.ServerConfig
-	log      *slog.Logger
-	enqueuer queue.Enqueuer
-	db       *sql.DB
+	cfg       config.ServerConfig
+	log       *slog.Logger
+	enqueuer  queue.Enqueuer
+	db        *sql.DB
+	heartbeat func() // chamado a cada volta do loop de eventos (liveness do /healthz)
 }
 
-func newBinlogWatcher(cfg config.ServerConfig, logger *slog.Logger, enqueuer queue.Enqueuer, db *sql.DB) *BinlogWatcher {
-	return &BinlogWatcher{cfg: cfg, log: logger.With("server_id", cfg.ServerID), enqueuer: enqueuer, db: db}
+func newBinlogWatcher(cfg config.ServerConfig, logger *slog.Logger, enqueuer queue.Enqueuer, db *sql.DB, heartbeat func()) *BinlogWatcher {
+	if heartbeat == nil {
+		heartbeat = func() {}
+	}
+	return &BinlogWatcher{cfg: cfg, log: logger.With("server_id", cfg.ServerID), enqueuer: enqueuer, db: db, heartbeat: heartbeat}
 }
 
 // decideStartPosition decide, sem I/O, se o watcher deve retomar de uma
@@ -116,6 +120,7 @@ func (b *BinlogWatcher) Start(ctx context.Context) error {
 	lastFlush := time.Now()
 
 	for {
+		b.heartbeat()
 		if ctx.Err() != nil {
 			b.persistPosition(pos)
 			b.log.Info("Encerrando watcher, posição final persistida")

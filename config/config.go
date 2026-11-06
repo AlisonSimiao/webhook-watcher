@@ -27,35 +27,43 @@ type ServerConfig struct {
 // DefaultServerConfig devolve a configuração padrão de desenvolvimento,
 // sobrescrevendo valores do arquivo .env quando presentes.
 func DefaultServerConfig() ServerConfig {
-	replicaID, err := strconv.Atoi(getEnv("REPLICA_ID", "100"))
+	replicaID, err := strconv.Atoi(GetEnv("REPLICA_ID", "100"))
 	if err != nil {
 		replicaID = 100
 	}
-	port, err := strconv.Atoi(getEnv("DB_PORT", "3306"))
+	port, err := strconv.Atoi(GetEnv("DB_PORT", "3306"))
 	if err != nil {
 		port = 3306
 	}
 	return ServerConfig{
-		ServerID:  getEnv("SERVER_ID", "DB01"),
+		ServerID:  GetEnv("SERVER_ID", "DB01"),
 		ReplicaID: uint32(replicaID),
-		Host:      getEnv("DB_HOST", "localhost"),
+		Host:      GetEnv("DB_HOST", "localhost"),
 		Port:      uint16(port),
-		User:      getEnv("DB_USER", "root"),
-		Password:  getEnv("DB_PASSWORD", "kodejifr"),
-		Flavor:    getEnv("DB_FLAVOR", mysql.MariaDBFlavor),
+		User:      GetEnv("DB_USER", "root"),
+		Password:  GetEnv("DB_PASSWORD", "kodejifr"),
+		Flavor:    GetEnv("DB_FLAVOR", mysql.MariaDBFlavor),
 	}
 }
 
-func getEnv(key, fallback string) string {
+// GetEnv devolve a variável de ambiente key, ou fallback se não estiver
+// definida (ou vazia).
+func GetEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
 }
 
+// sqlitePragmas é aplicado em toda conexão aberta: producer e consumer
+// escrevem no mesmo servers.db em processos separados. busy_timeout faz uma
+// escrita esperar (até 5s) o lock da outra em vez de falhar na hora com
+// SQLITE_BUSY; WAL deixa leituras e escrita rodarem em paralelo.
+const sqlitePragmas = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+
 // InitDB abre/cria o banco SQLite e garante o esquema de binlog_servers.
 func InitDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", dbPath+sqlitePragmas)
 	if err != nil {
 		return nil, fmt.Errorf("erro ao abrir banco SQLite %s: %w", dbPath, err)
 	}
@@ -101,6 +109,23 @@ CREATE TABLE IF NOT EXISTS failed_events (
 	if _, err := db.Exec(failedEventsSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("erro ao criar tabela failed_events: %w", err)
+	}
+
+	const failedDeliveriesSchema = `
+CREATE TABLE IF NOT EXISTS failed_deliveries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id   TEXT     NOT NULL,
+    tenant     TEXT     NOT NULL,
+    table_name TEXT     NOT NULL,
+    action     TEXT     NOT NULL,
+    url        TEXT     NOT NULL,
+    payload    TEXT     NOT NULL,
+    error      TEXT     NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`
+	if _, err := db.Exec(failedDeliveriesSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("erro ao criar tabela failed_deliveries: %w", err)
 	}
 
 	return db, nil
@@ -200,6 +225,23 @@ func SaveFailedEvent(db *sql.DB, serverID, eventID, tenant, table, action string
 	)
 	if err != nil {
 		return fmt.Errorf("erro ao salvar evento descartado: %w", err)
+	}
+	return nil
+}
+
+// SaveFailedDelivery persiste uma falha de entrega HTTP (após o consumer
+// esgotar as tentativas do asynq para uma URL de destino), para consulta e
+// intervenção manual posterior — mesmo padrão de SaveFailedEvent, mas do
+// lado consumer: sem server_id (o consumer não sabe de qual servidor de
+// binlog o evento veio) e com url (identifica qual destino falhou, já que um
+// evento pode ter mais de um).
+func SaveFailedDelivery(db *sql.DB, eventID, tenant, table, action, url string, payload []byte, errMsg string) error {
+	_, err := db.Exec(
+		`INSERT INTO failed_deliveries (event_id, tenant, table_name, action, url, payload, error) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		eventID, tenant, table, action, url, string(payload), errMsg,
+	)
+	if err != nil {
+		return fmt.Errorf("erro ao salvar entrega descartada: %w", err)
 	}
 	return nil
 }

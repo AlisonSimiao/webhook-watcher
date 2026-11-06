@@ -21,18 +21,22 @@ const (
 const taskTypeEvent = "webhook:event"
 
 // ErrDuplicate indica que o evento já está na fila (mesmo TaskID). É o erro
-// retornado pelo Enqueue quando o binlog entrega o mesmo evento de novo (não há
-// resume de posição entre restarts); pode ser tratado como no-op idempotente.
+// retornado pelo Enqueue quando o binlog entrega o mesmo evento de novo (ex:
+// após um restart, o resume reprocessa os eventos desde a última posição
+// persistida); pode ser tratado como no-op idempotente. Só cobre tasks ainda
+// presentes no Redis — por isso a entrega é pelo menos uma vez (docs/adr/0001).
 var ErrDuplicate = asynq.ErrTaskIDConflict
 
 // RedisQueue é o adapter Redis (via asynq) do port Enqueuer.
 type RedisQueue struct {
-	client *asynq.Client
+	client    *asynq.Client
+	queueName string
 }
 
-// NewRedisQueue cria o adapter Redis. addr é "host:port" do Redis.
-func NewRedisQueue(addr string) *RedisQueue {
-	return &RedisQueue{client: asynq.NewClient(asynq.RedisClientOpt{Addr: addr})}
+// NewRedisQueue cria o adapter Redis. addr é "host:port" do Redis; queueName é
+// o nome da fila asynq (ex: QueueNameHTTP ou QueueNameHTTPShard(i)).
+func NewRedisQueue(addr, queueName string) *RedisQueue {
+	return &RedisQueue{client: asynq.NewClient(asynq.RedisClientOpt{Addr: addr}), queueName: queueName}
 }
 
 // Enqueue publica o evento na fila. O Event.ID vira o TaskID do asynq, o que
@@ -47,12 +51,17 @@ func (q *RedisQueue) Enqueue(ctx context.Context, event *Event) error {
 	task := asynq.NewTask(taskTypeEvent, payload,
 		asynq.MaxRetry(defaultMaxRetries),
 		asynq.Timeout(defaultTaskTimeout),
-		asynq.Queue(QueueName),
+		asynq.Queue(q.queueName),
 	)
 	if _, err := q.client.EnqueueContext(ctx, task, asynq.TaskID(event.ID)); err != nil {
 		return fmt.Errorf("erro ao enfileirar evento %s: %w", event.ID, err)
 	}
 	return nil
+}
+
+// Ping verifica a conexão com o Redis (usado pelo /healthz).
+func (q *RedisQueue) Ping() error {
+	return q.client.Ping()
 }
 
 // Close encerra a conexão com o Redis.

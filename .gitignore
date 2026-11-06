@@ -1,2 +1,6 @@
 .env
-servers.db
+.env.staging
+*.db
+*.db-wal
+*.db-shm
+.claude/

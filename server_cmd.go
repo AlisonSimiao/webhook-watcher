@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"webhook-watcher/config"
@@ -25,6 +26,20 @@ func openDB() *sql.DB {
 		os.Exit(1)
 	}
 	return db
+}
+
+// httpShardCount lê HTTP_CONSUMER_SHARDS. Precisa ser o mesmo valor no
+// processo produtor (initQueue, main.go) e no consumer (runHTTPConsumer,
+// consumer_cmd.go) — um valor divergente faz eventos roteados para um shard
+// "extra" ficarem parados sem erro visível.
+func httpShardCount() int {
+	raw := config.GetEnv("HTTP_CONSUMER_SHARDS", "16")
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		slog.Warn("HTTP_CONSUMER_SHARDS inválido; usando default 16", "valor", raw)
+		return 16
+	}
+	return n
 }
 
 // runServerCommand executa um subcomando de gerenciamento de servidores e

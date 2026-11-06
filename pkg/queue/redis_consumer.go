@@ -22,15 +22,16 @@ type WorkerConfig struct {
 	Concurrency int
 }
 
-// NewRedisWorker cria o worker conectado ao mesmo Redis/addr da produção.
-func NewRedisWorker(addr string, cfg WorkerConfig) *RedisWorker {
+// NewRedisWorker cria o worker conectado ao mesmo Redis/addr da produção,
+// consumindo a fila queueName (ex: QueueNameHTTPShard(i)).
+func NewRedisWorker(addr, queueName string, cfg WorkerConfig) *RedisWorker {
 	concurrency := cfg.Concurrency
 	if concurrency == 0 {
 		concurrency = 10
 	}
 	server := asynq.NewServer(asynq.RedisClientOpt{Addr: addr}, asynq.Config{
 		Concurrency: concurrency,
-		Queues:      map[string]int{QueueName: 6},
+		Queues:      map[string]int{queueName: 6},
 	})
 	return &RedisWorker{server: server, mux: asynq.NewServeMux()}
 }

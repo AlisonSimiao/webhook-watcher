@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
@@ -21,6 +22,7 @@ type RowsStrategy struct {
 	serverID   string
 	enqueuer   queue.Enqueuer
 	processors []tables.TableProcessor
+	now        func() time.Time // relógio da dataEvento; injetável nos testes
 }
 
 func defaultProcessors() []tables.TableProcessor {
@@ -69,8 +71,19 @@ func rowResourceID(newRow []interface{}) (int, bool) {
 	}
 }
 
-// dispatchTable verifica se há um TableProcessor registrado para a tabela.
-func (r *RowsStrategy) dispatchTable(schema, tableName, action string, newRow, oldRow []interface{}) (interface{}, bool, error) {
+// dataEvento formata o instante da leitura do estado do Recurso como no
+// Contrato: ISO-8601 em UTC com milissegundos.
+func (r *RowsStrategy) dataEvento() string {
+	now := time.Now
+	if r.now != nil {
+		now = r.now
+	}
+	return now().UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// dispatchTable verifica se há um TableProcessor registrado para a tabela e
+// devolve o tipo de Recurso e o Recurso montado por ele.
+func (r *RowsStrategy) dispatchTable(schema, tableName, action string, newRow, oldRow []interface{}) (string, interface{}, bool, error) {
 	tCtx := &tables.TableContext{
 		TableName: tableName,
 		Schema:    schema,
@@ -84,11 +97,11 @@ func (r *RowsStrategy) dispatchTable(schema, tableName, action string, newRow, o
 	for _, proc := range r.processors {
 		if proc.Supports(tableName) {
 			res, err := proc.Process(tCtx)
-			return res, true, err
+			return proc.Tipo(), res, true, err
 		}
 	}
 
-	return nil, false, nil
+	return "", nil, false, nil
 }
 
 // emit loga o evento e o enfileira. Eventos duplicados (mesmo TaskID) são

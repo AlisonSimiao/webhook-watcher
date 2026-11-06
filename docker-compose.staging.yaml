@@ -1,0 +1,92 @@
+# Deploy de staging do Webhook Watcher (uma máquina com Docker: local ou VPS/EC2).
+#
+#   cp .env.example .env.staging   # preencha DB_*, REPLICA_ID, SRP_HUB_API_*
+#   docker compose -f docker-compose.staging.yaml up -d --build
+#
+# - watcher (producer) e consumer usam a MESMA imagem e o MESMO env_file, o que
+#   garante o mesmo HTTP_CONSUMER_SHARDS nos dois.
+# - Os dois montam o mesmo volume em /data: servers.db (servidores, posição do
+#   binlog, failed_events, failed_deliveries) é compartilhado e sobrevive a
+#   restarts. Comandos administrativos rodam em qualquer um dos dois, ex:
+#     docker compose -f docker-compose.staging.yaml exec watcher ./webhook-watcher server list
+#     docker compose -f docker-compose.staging.yaml exec consumer ./webhook-watcher failed-deliveries list
+# - O servidor MariaDB é semeado de DB_* na primeira subida (tabela vazia);
+#   depois disso, altere com "server update", não pelo .env.staging.
+# - Redis não é publicado no host; asynqmon e /healthz só em 127.0.0.1
+#   (acesse por túnel SSH se a máquina for remota).
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  watcher:
+    build: .
+    image: webhook-watcher:staging
+    restart: unless-stopped
+    env_file: .env.staging
+    environment:
+      REDIS_ADDR: redis:6379
+      HEALTH_ADDR: ":8090"
+    volumes:
+      - watcher-data:/data
+    ports:
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # SIGTERM persiste a posição do binlog antes de sair; dá tempo para o
+    # loop (timeout de 2s no GetEvent) perceber o encerramento.
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  consumer:
+    build: .
+    image: webhook-watcher:staging
+    command: ["consumer", "http"]
+    restart: unless-stopped
+    env_file: .env.staging
+    environment:
+      REDIS_ADDR: redis:6379
+      HEALTH_ADDR: ":8091"
+    volumes:
+      - watcher-data:/data
+    ports:
+      - "127.0.0.1:8091:8091"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Shutdown do asynq espera as tasks em andamento (timeout HTTP de 10s).
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8091/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  asynqmon:
+    image: hibiken/asynqmon
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    command: ["--redis-addr=redis:6379"]
+
+volumes:
+  redis-data:
+  watcher-data:
