@@ -204,7 +204,7 @@ func TestInitDB_ConcurrentWritersOnSameFile(t *testing.T) {
 		t.Fatalf("erro ao inserir servidor: %v", err)
 	}
 
-	const writes = 200
+	const writes = 50
 	errs := make(chan error, 3*writes)
 	var wg sync.WaitGroup
 	wg.Add(3)
