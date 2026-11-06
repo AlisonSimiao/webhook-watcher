@@ -29,20 +29,13 @@ var rotaPorTipo = map[string]string{
 	"pedidos": "pedidos",
 }
 
-// hookBody é o corpo que a rota /interno/hooks/<tipo> do srp-hub-api recebe
-// (src/components/hook/hook.dto.js). O Contrato é traduzido para exatamente
-// esse formato: por decisão (docs/adr/0003), mudanças no Contrato não chegam
-// ao srp-hub-api — idEvento, dataEvento, tipo e tenant ficam de fora do corpo.
-type hookBody struct {
-	TipoModificacao queue.TipoModificacao `json:"tipoModificacao"`
-	Recurso         json.RawMessage       `json:"recurso"`
-}
-
 // Delivery entrega eventos repassando para o srp-hub-api (POST
 // <baseURL>/interno/hooks/<tipo>), que já resolve os destinos de webhook por
 // cliente (clientes_hooks/cliente) e faz o fan-out — este consumer não lê
-// mais aquelas tabelas diretamente. É um adapter: traduz o Contrato canônico
-// em Event.Payload para o hookBody que aquela rota espera.
+// mais aquelas tabelas diretamente. O corpo é o Contrato canônico inteiro,
+// como está em Event.Payload (docs/adr/0003): a rota só valida
+// tipoModificacao e recurso e ignora os demais campos, que ficam disponíveis
+// para quem quiser usá-los.
 type Delivery struct {
 	baseURL  string
 	token    string
@@ -92,7 +85,7 @@ func (d *Delivery) Handle(ctx context.Context, event *queue.Event) error {
 		// Evento enfileirado antes do Contrato existir ({tipoModificacao,
 		// recurso}, sem tipo) — producer e consumer em versões diferentes
 		// durante um deploy. Roteia pela tabela do envelope em vez de
-		// descartar; o corpo sai igual ao de antes.
+		// descartar; o corpo sai como foi enfileirado.
 		d.log.Warn("Evento sem tipo no Contrato (formato antigo); roteando por Event.Table", "event_id", event.ID, "table", event.Table)
 		contrato.Tipo = event.Table
 	}
@@ -103,13 +96,8 @@ func (d *Delivery) Handle(ctx context.Context, event *queue.Event) error {
 		return nil
 	}
 
-	body, err := json.Marshal(hookBody{TipoModificacao: contrato.TipoModificacao, Recurso: contrato.Recurso})
-	if err != nil {
-		return fmt.Errorf("erro ao montar corpo do hook para o evento %s: %w", event.ID, err)
-	}
-
 	url := fmt.Sprintf("%s/interno/hooks/%s", d.baseURL, tipo)
-	if err := d.deliverOne(ctx, url, event.Tenant, body); err != nil {
+	if err := d.deliverOne(ctx, url, event.Tenant, event.Payload); err != nil {
 		d.log.Error("Falha ao repassar evento para srp-hub-api", "url", url, "event_id", event.ID, "tenant", event.Tenant, "error", err)
 		if isLastAttempt(ctx) {
 			d.saveFailedDelivery(event, url, err)

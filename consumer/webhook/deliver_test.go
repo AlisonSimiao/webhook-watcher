@@ -41,7 +41,7 @@ func TestDelivery_Handle_UnknownTipoIsNoop(t *testing.T) {
 	}
 }
 
-func TestDelivery_Handle_TranslatesContractToHookBody(t *testing.T) {
+func TestDelivery_Handle_SendsFullContractAsBody(t *testing.T) {
 	var gotPath, gotAuth, gotTenant, gotContentType string
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -73,9 +73,9 @@ func TestDelivery_Handle_TranslatesContractToHookBody(t *testing.T) {
 	if gotContentType != "application/json" {
 		t.Fatalf("Content-Type inesperado: %q", gotContentType)
 	}
-	// O srp-hub-api recebe exatamente o formato de hoje: sem idEvento,
-	// dataEvento, tipo ou tenant no corpo (ADR 0003, sem mudanças lá).
-	want := `{"tipoModificacao":"M","recurso":{"id":42}}`
+	// O corpo é o Contrato inteiro (ADR 0003): os metadados vão mesmo que o
+	// srp-hub-api ainda só use tipoModificacao e recurso.
+	want := `{"idEvento":"evt_1","tipo":"pedidos","tipoModificacao":"M","dataEvento":"2026-11-06T14:03:12.457Z","tenant":"acme","recurso":{"id":42}}`
 	if string(gotBody) != want {
 		t.Fatalf("corpo enviado incorreto: esperava %s, obteve %s", want, gotBody)
 	}

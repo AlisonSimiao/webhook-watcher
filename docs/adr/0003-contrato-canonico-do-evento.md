@@ -4,4 +4,6 @@ O formato do Evento é definido por este projeto e preenchido pelo producer de f
 
 ## Consequences
 
-- O adapter do srp-hub-api traduz o contrato canônico de volta para exatamente `{tipoModificacao, recurso}` — o que aquela rota recebe hoje. Por decisão, mudanças no contrato não exigem nem provocam mudanças no srp-hub-api; por isso, por enquanto, os clientes atendidos por ele não recebem os metadados novos (e não podem descartar snapshots antigos).
+- O consumer HTTP envia ao srp-hub-api o contrato canônico inteiro como corpo, sem tradução: metadados como `idEvento` e `dataEvento` vão mesmo para um destino que ainda não os usa, porque outros consumidores podem usá-los e um campo novo no contrato chega sem mexer no consumer. A rota `/interno/hooks/<tipo>` aceita o corpo (valida só `tipoModificacao` e `recurso`).
+- O srp-hub-api não é alterado por esta decisão: ele monta o que entrega ao cliente final só com `tipoModificacao` e `recurso` (`HookSendDto`), então os clientes atendidos por ele ainda não recebem os metadados (e não podem descartar snapshots antigos) até que aquele lado passe a repassá-los.
+- Antes, o adapter traduzia o contrato de volta para exatamente `{tipoModificacao, recurso}`; isso foi revertido (2026-11-06) para não esconder os metadados de quem está do outro lado.
