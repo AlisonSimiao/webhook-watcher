@@ -116,13 +116,12 @@ func (b *BinlogWatcher) Start(ctx context.Context) error {
 
 	prod := producer.NewProducer(b.log, mariadb, b.db, b.cfg.ServerID, b.enqueuer)
 
-	const flushInterval = 5 * time.Second
-	lastFlush := time.Now()
+	tracker := newPositionTracker(pos, time.Now())
 
 	for {
 		b.heartbeat()
 		if ctx.Err() != nil {
-			b.persistPosition(pos)
+			b.persistPosition(tracker.Safe())
 			b.log.Info("Encerrando watcher, posição final persistida")
 			return nil
 		}
@@ -135,44 +134,43 @@ func (b *BinlogWatcher) Start(ctx context.Context) error {
 			continue
 		}
 		if ctx.Err() != nil {
-			b.persistPosition(pos)
+			b.persistPosition(tracker.Safe())
 			b.log.Info("Encerrando watcher, posição final persistida")
 			return nil
 		}
 		if err != nil {
-			b.persistPosition(pos)
+			b.persistPosition(tracker.Safe())
 			return fmt.Errorf("erro no evento: %w", err)
 		}
 
 		if ev != nil {
 			// Evento de rotação: atualiza nome e posição do binlog para o próximo arquivo
-			if rotate, ok := ev.Event.(*replication.RotateEvent); ok {
-				pos.Name = string(rotate.NextLogName)
-				pos.Pos = uint32(rotate.Position)
-				b.log.Info("Binlog rotacionado", "binlog_file", pos.Name, "binlog_pos", pos.Pos)
-				b.persistPosition(pos)
-				lastFlush = time.Now()
+			if _, ok := ev.Event.(*replication.RotateEvent); ok {
+				save, ok := tracker.Observe(ev, time.Now())
+				cur := tracker.Current()
+				b.log.Info("Binlog rotacionado", "binlog_file", cur.Name, "binlog_pos", cur.Pos)
+				if ok {
+					b.persistPosition(save)
+				}
 				continue
 			}
 
 			// NÃO reordenar: HandleEvent recebe a posição PRÉ-mutação (usada em generateEventID)
+			cur := tracker.Current()
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						b.log.Error("Panic ao processar evento; evento descartado, watcher continua",
-							"recover", r, "binlog_file", pos.Name, "binlog_pos", pos.Pos)
+							"recover", r, "binlog_file", cur.Name, "binlog_pos", cur.Pos)
 					}
 				}()
-				if err := prod.HandleEvent(pos.Name, pos.Pos, ev); err != nil {
+				if err := prod.HandleEvent(cur.Name, cur.Pos, ev); err != nil {
 					b.log.Error("Erro ao processar evento; evento pode ter sido perdido",
-						"error", err, "binlog_file", pos.Name, "binlog_pos", pos.Pos)
+						"error", err, "binlog_file", cur.Name, "binlog_pos", cur.Pos)
 				}
 			}()
-			pos.Pos = ev.Header.LogPos
-
-			if time.Since(lastFlush) >= flushInterval {
-				b.persistPosition(pos)
-				lastFlush = time.Now()
+			if save, ok := tracker.Observe(ev, time.Now()); ok {
+				b.persistPosition(save)
 			}
 		}
 	}
