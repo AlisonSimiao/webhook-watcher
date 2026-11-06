@@ -1,13 +1,5 @@
 package pedido
 
-type TipoModificacao string
-
-const (
-	TipoModificacaoCriado     TipoModificacao = "C"
-	TipoModificacaoModificado TipoModificacao = "M"
-	TipoModificacaoDeletado   TipoModificacao = "D"
-)
-
 type PedidoItem struct {
 	Sequencia               int     `json:"sequencia"`
 	CodigoProduto           string  `json:"codigoProduto"`
@@ -81,9 +73,4 @@ type PedidoRecurso struct {
 	CnpjEmpresa                 string                            `json:"cnpjEmpresa"`
 	CamposPersonalizados        map[string]map[string]interface{} `json:"camposPersonalizados"`
 	Itens                       []PedidoItem                      `json:"itens"`
-}
-
-type PedidoEvent struct {
-	TipoModificacao TipoModificacao `json:"tipoModificacao"`
-	Recurso         PedidoRecurso   `json:"recurso"`
 }

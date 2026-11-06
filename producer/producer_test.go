@@ -5,10 +5,12 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
 	"webhook-watcher/pkg/queue"
+	"webhook-watcher/tables"
 	"webhook-watcher/tables/pedido"
 )
 
@@ -40,9 +42,11 @@ func pedidoRow() []interface{} {
 	return row
 }
 
-func TestUpdateStrategyEmitsCustomEvent(t *testing.T) {
+func TestUpdateStrategyEmitsCanonicalContract(t *testing.T) {
 	mem := queue.NewMemoryQueue()
 	prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
+	leitura := time.Date(2026, 11, 6, 11, 3, 12, 457_000_000, time.FixedZone("BRT", -3*60*60))
+	prod.update.now = func() time.Time { return leitura }
 
 	err := prod.HandleEvent("mysql-bin.000001", 123, binlogUpdateEvent("meu_tenant", "pedidos", [][]interface{}{
 		{int32(42)},
@@ -66,26 +70,74 @@ func TestUpdateStrategyEmitsCustomEvent(t *testing.T) {
 	if event.Action != queue.ActionUpdate {
 		t.Errorf("Action inesperado: %s", event.Action)
 	}
-	if event.Timestamp != 1780000000 {
-		t.Errorf("Timestamp inesperado: %d", event.Timestamp)
-	}
 	if len(event.ID) == 0 || event.ID[:4] != "evt_" {
 		t.Errorf("ID malformado: %s", event.ID)
 	}
 
-	var payload pedido.PedidoEvent
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		t.Fatalf("payload não é um PedidoEvent válido: %v", err)
+	var contrato queue.Contrato
+	if err := json.Unmarshal(event.Payload, &contrato); err != nil {
+		t.Fatalf("payload não é um Contrato válido: %v", err)
 	}
-	if payload.TipoModificacao != pedido.TipoModificacaoModificado {
-		t.Errorf("TipoModificacao inesperado: %s", payload.TipoModificacao)
+	if contrato.IDEvento != event.ID {
+		t.Errorf("IDEvento inesperado: %s (esperava %s)", contrato.IDEvento, event.ID)
 	}
-	if payload.Recurso.ID != 42 {
-		t.Errorf("Recurso.ID inesperado: %d", payload.Recurso.ID)
+	if contrato.Tipo != "pedidos" {
+		t.Errorf("Tipo inesperado: %s", contrato.Tipo)
 	}
-	if payload.Recurso.Codigo != "PED-00042" {
-		t.Errorf("Recurso.Codigo inesperado: %s", payload.Recurso.Codigo)
+	if contrato.TipoModificacao != queue.TipoModificacaoModificado {
+		t.Errorf("TipoModificacao inesperado: %s", contrato.TipoModificacao)
 	}
+	// dataEvento = instante da leitura do estado, em UTC com milissegundos.
+	if contrato.DataEvento != "2026-11-06T14:03:12.457Z" {
+		t.Errorf("DataEvento inesperado: %s", contrato.DataEvento)
+	}
+	if contrato.Tenant != "meu_tenant" {
+		t.Errorf("Tenant inesperado: %s", contrato.Tenant)
+	}
+
+	var recurso pedido.PedidoRecurso
+	if err := json.Unmarshal(contrato.Recurso, &recurso); err != nil {
+		t.Fatalf("recurso não é um PedidoRecurso válido: %v", err)
+	}
+	if recurso.ID != 42 {
+		t.Errorf("Recurso.ID inesperado: %d", recurso.ID)
+	}
+	if recurso.Codigo != "PED-00042" {
+		t.Errorf("Recurso.Codigo inesperado: %s", recurso.Codigo)
+	}
+}
+
+func TestDataEventoTakenBeforeEnrichment(t *testing.T) {
+	mem := queue.NewMemoryQueue()
+	prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
+
+	var ordem []string
+	prod.update.now = func() time.Time {
+		ordem = append(ordem, "relogio")
+		return time.Unix(0, 0)
+	}
+	prod.update.processors = []tables.TableProcessor{&processorEspiao{ordem: &ordem}}
+
+	if err := prod.HandleEvent("mysql-bin.000001", 123, binlogUpdateEvent("meu_tenant", "pedidos", [][]interface{}{
+		{int32(42)},
+		pedidoRow(),
+	})); err != nil {
+		t.Fatalf("HandleEvent retornou erro: %v", err)
+	}
+	if len(ordem) != 2 || ordem[0] != "relogio" || ordem[1] != "process" {
+		t.Fatalf("dataEvento deve ser lida antes do Process (enriquecimento); ordem: %v", ordem)
+	}
+}
+
+// processorEspiao registra quando Process é chamado, para verificar que a
+// dataEvento é capturada antes da leitura do estado.
+type processorEspiao struct{ ordem *[]string }
+
+func (p *processorEspiao) Supports(string) bool { return true }
+func (p *processorEspiao) Tipo() string         { return "pedidos" }
+func (p *processorEspiao) Process(*tables.TableContext) (interface{}, error) {
+	*p.ordem = append(*p.ordem, "process")
+	return map[string]int{"id": 42}, nil
 }
 
 func TestUpdateStrategySkipsUnregisteredTable(t *testing.T) {

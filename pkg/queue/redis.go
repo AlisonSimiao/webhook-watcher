@@ -21,8 +21,10 @@ const (
 const taskTypeEvent = "webhook:event"
 
 // ErrDuplicate indica que o evento já está na fila (mesmo TaskID). É o erro
-// retornado pelo Enqueue quando o binlog entrega o mesmo evento de novo (não há
-// resume de posição entre restarts); pode ser tratado como no-op idempotente.
+// retornado pelo Enqueue quando o binlog entrega o mesmo evento de novo (ex:
+// após um restart, o resume reprocessa os eventos desde a última posição
+// persistida); pode ser tratado como no-op idempotente. Só cobre tasks ainda
+// presentes no Redis — por isso a entrega é pelo menos uma vez (docs/adr/0001).
 var ErrDuplicate = asynq.ErrTaskIDConflict
 
 // RedisQueue é o adapter Redis (via asynq) do port Enqueuer.

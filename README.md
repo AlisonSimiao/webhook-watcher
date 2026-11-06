@@ -10,16 +10,16 @@ O programa se conecta como um **replicador** ao MariaDB, lê o binlog em tempo r
 2. `config.LoadServersFromDB()` carrega os servidores ativos (`is_active = 1`).
 3. Uma **goroutine por servidor** roda `BinlogWatcher.Start()`. Se o servidor já tem uma posição salva em `binlog_servers` (`binlog_file`/`binlog_pos`), o stream **retoma exatamente daquele ponto**; na primeira execução (posição vazia), consulta `SHOW MASTER STATUS` e começa a partir da posição atual do master. A posição é persistida periodicamente (a cada rotação de binlog, a cada 5s de avanço, e ao encerrar), garantindo resume-on-restart por servidor.
 4. Em um loop, cada evento do binlog é roteado pelo `Producer` para a **estratégia** correspondente ao tipo de evento.
-5. Para `UPDATE`, as linhas chegam em pares old/new. Apenas tabelas com `TableProcessor` registrado (ex: `pedidos`) geram eventos: a linha nova é enriquecida com queries no MariaDB e vira o payload do evento, com um ID único.
-6. O evento é **enfileirado** via `queue.Enqueuer` — um `FanoutQueue` publica em uma fila por tipo de consumidor (hoje só `webhook-events.http`), e dentro do tipo HTTP um `ShardedQueue` roteia por hash de `tenant:table:resourceID` para um entre N shards, preservando a ordem de entrega por recurso — e também logado em JSON (campo `evento`).
-7. Do outro lado, `go run . consumer http` consome cada shard (um `RedisWorker` por shard, concorrência 1) e repassa o payload do evento (`{tipoModificacao, recurso}`) via HTTP POST para `<SRP_HUB_API_BASE_URL>/interno/hooks/<tipo>` — é o `srp-hub-api` quem resolve os destinos por cliente e faz a entrega final.
+5. Para `UPDATE`, as linhas chegam em pares old/new. Apenas tabelas com `TableProcessor` registrado (ex: `pedidos`) geram eventos: a linha nova é enriquecida com queries no MariaDB e vira o `recurso` do **Contrato** canônico do evento (`{idEvento, tipo, tipoModificacao, dataEvento, tenant, recurso}` — ver [Evento gerado](#evento-gerado)).
+6. O evento é **enfileirado** via `queue.Enqueuer` — um `FanoutQueue` publica em uma fila por tipo de consumidor (hoje só `webhook-events.http`), e dentro do tipo HTTP um `ShardedQueue` roteia por hash de `tenant:table:resourceID` para um entre N shards, mantendo a ordem por recurso em melhor esforço (não garantida: ver [ADR 0001](docs/adr/0001-eventos-sao-snapshots-entregues-pelo-menos-uma-vez.md)) — e também logado em JSON (campo `evento`).
+7. Do outro lado, `go run . consumer http` consome cada shard (um `RedisWorker` por shard, concorrência 1) e traduz o Contrato para o corpo que o `srp-hub-api` já espera (`{tipoModificacao, recurso}`), enviado via HTTP POST para `<SRP_HUB_API_BASE_URL>/interno/hooks/<tipo>` — é o `srp-hub-api` quem resolve os destinos por cliente e faz a entrega final.
 
 ## Logs estruturados (CloudWatch)
 
 Todos os logs são **JSON estruturado** via `slog`, uma linha por registro, com `time`, `level`, `msg` e atributos pesquisáveis — ideal para CloudWatch Logs Insights:
 
 ```json
-{"time":"2026-08-02T01:37:19.029Z","level":"INFO","msg":"Evento processado","server_id":"DB01","evento":{"id":"evt_ab12cd34...","tenant":"meu_tenant","table":"pedidos","action":"UPDATE","timestamp":1780000000,"payload":{"tipoModificacao":"M","recurso":{...}}}}
+{"time":"2026-08-02T01:37:19.029Z","level":"INFO","msg":"Evento processado","server_id":"DB01","evento":{"id":"evt_ab12cd34...","tenant":"meu_tenant","table":"pedidos","action":"UPDATE","resource_id":123,"payload":{"idEvento":"evt_ab12cd34...","tipo":"pedidos","tipoModificacao":"M","dataEvento":"2026-08-02T01:37:18.912Z","tenant":"meu_tenant","recurso":{...}}}}
 ```
 
 > O log é a **observabilidade** — o caminho principal de cada evento é a **fila** (Redis), não o stdout. Quem lê a fila e repassa o webhook é o `consumer http` (ver [Como rodar](#como-rodar)).
@@ -108,18 +108,18 @@ flowchart LR
     REDIS --> ASYNQMON
     REDIS -->|"shard 0"| WORKER0 --> DELIVERY
     REDIS -->|"shard N-1"| WORKERN --> DELIVERY
-    DELIVERY -->|"POST Event.Payload<br/>Authorization + tenant"| SRPAPI
+    DELIVERY -->|"POST {tipoModificacao, recurso}<br/>(traduzido do Contrato)<br/>Authorization + tenant"| SRPAPI
     DELIVERY -.->|"falha na última tentativa"| SQLITE
     PROD --> CLOUD
 ```
 
 Fluxo resumido: `main.go` carrega os servidores do SQLite (semeando do `.env` quando vazio), dispara uma goroutine por servidor que replica o binlog do MariaDB retomando da última posição persistida para aquele servidor (ou da posição atual via `SHOW MASTER STATUS` na primeira execução), o `Producer` roteia cada evento para a estratégia do tipo (`UPDATE`), e a estratégia despacha para o `TableProcessor` registrado (com enriquecimento via queries no MariaDB). Tabelas sem processor não geram evento. Cada watcher também persiste sua posição de leitura de volta no SQLite (a cada rotação de binlog, a cada ~5s de avanço, e ao encerrar via SIGINT/SIGTERM), permitindo retomar exatamente do ponto onde parou em um restart.
 
-**Produção de eventos para a fila (caminho principal):** para cada UPDATE em uma tabela monitorada, o producer monta o envelope (`queue.Event` com ID único) + payload enriquecido e faz `Enqueue` via `queue.Enqueuer` → `FanoutQueue` → `ShardedQueue` (fila `webhook-events.http.<N>`) → Redis. O enqueue é **idempotente** por fila (`TaskID` = `Event.ID`). O log JSON para o stdout/CloudWatch é apenas observabilidade — o caminho real é a fila.
+**Produção de eventos para a fila (caminho principal):** para cada UPDATE em uma tabela monitorada, o producer monta o envelope interno (`queue.Event` com ID único) + o Contrato canônico como payload e faz `Enqueue` via `queue.Enqueuer` → `FanoutQueue` → `ShardedQueue` (fila `webhook-events.http.<N>`) → Redis. O enqueue é **idempotente** por fila (`TaskID` = `Event.ID`). O log JSON para o stdout/CloudWatch é apenas observabilidade — o caminho real é a fila.
 
-**Consumo e repasse (`go run . consumer http`):** um processo separado, com uma goroutine por shard, cada uma com seu próprio `RedisWorker` escutando `webhook-events.http.<shard>` em concorrência 1 — é essa concorrência 1 por shard, não o hash em si, que preserva a ordem das **nossas** chamadas por recurso (`tenant:table:resourceID` sempre cai no mesmo shard; shards diferentes processam em paralelo). `N` (`HTTP_CONSUMER_SHARDS`) **precisa ser o mesmo valor** nos dois processos — um valor divergente faz eventos roteados para um shard "extra" ficarem parados sem erro visível. Não há mais resolução de destino própria: `Delivery.Handle` só traduz `Event.Table` para o segmento `<tipo>` da rota e faz `POST` do `Event.Payload` (já `{tipoModificacao, recurso}`) para `<SRP_HUB_API_BASE_URL>/interno/hooks/<tipo>`, com `Authorization`/`tenant` nos headers — quem resolve `clientes_hooks`/`cliente` e entrega pro cliente final é o `srp-hub-api`. Falha nessa chamada aciona o retry/backoff do próprio asynq; na última tentativa, também é gravada em `failed_deliveries`.
+**Consumo e repasse (`go run . consumer http`):** um processo separado, com uma goroutine por shard, cada uma com seu próprio `RedisWorker` escutando `webhook-events.http.<shard>` em concorrência 1 — é essa concorrência 1 por shard, não o hash em si, que mantém a ordem das **nossas** chamadas por recurso (`tenant:table:resourceID` sempre cai no mesmo shard; shards diferentes processam em paralelo). É **melhor esforço**: quando uma entrega falha, a task vai para o retry do asynq e o shard segue para a próxima, então um snapshot mais antigo pode ser entregue depois de um mais novo. A defesa é a `dataEvento` do Contrato (quem consome descarta o mais antigo) — ver [ADR 0001](docs/adr/0001-eventos-sao-snapshots-entregues-pelo-menos-uma-vez.md). `N` (`HTTP_CONSUMER_SHARDS`) **precisa ser o mesmo valor** nos dois processos — um valor divergente faz eventos roteados para um shard "extra" ficarem parados sem erro visível. Não há mais resolução de destino própria: `Delivery.Handle` lê o Contrato de `Event.Payload`, traduz o `tipo` para o segmento `<tipo>` da rota e faz `POST` de `{tipoModificacao, recurso}` para `<SRP_HUB_API_BASE_URL>/interno/hooks/<tipo>`, com `Authorization`/`tenant` nos headers — quem resolve `clientes_hooks`/`cliente` e entrega pro cliente final é o `srp-hub-api`. Falha nessa chamada aciona o retry/backoff do próprio asynq; na última tentativa, também é gravada em `failed_deliveries`.
 
-**Importante — a ordem só é garantida até essa chamada, não até o cliente final**: a rota `/interno/hooks/<tipo>` do `srp-hub-api` responde antes de terminar seu próprio fan-out para o cliente. Duas chamadas nossas em sequência (garantidamente em ordem, por causa da concorrência 1) podem disparar dois envios internos do `srp-hub-api` que rodam em paralelo do lado de lá e terminam fora de ordem no cliente final. Essa fragilidade já existe hoje naquela rota, independente de quem a chama — não é algo que este consumer introduz, é algo que ele herda ao repassar por ali. Ver [Relação com srp-hub-api](#relação-com-srp-hub-api).
+**Importante — nem a ordem das nossas chamadas chega intacta ao cliente final**: a rota `/interno/hooks/<tipo>` do `srp-hub-api` responde antes de terminar seu próprio fan-out para o cliente. Duas chamadas nossas em sequência podem disparar dois envios internos do `srp-hub-api` que rodam em paralelo do lado de lá e terminam fora de ordem no cliente final. Essa fragilidade já existe hoje naquela rota, independente de quem a chama — não é algo que este consumer introduz, é algo que ele herda ao repassar por ali. Ver [Relação com srp-hub-api](#relação-com-srp-hub-api).
 
 Ver [Extensibilidade](#extensibilidade-plugando-um-novo-tipo-de-consumidor) para como um novo tipo de consumidor (SSE, notificações) se conecta a esse mesmo desenho.
 
@@ -137,8 +137,8 @@ main.go → config.InitDB() + LoadServersFromDB() → goroutine por servidor
 - **`binlog.go`** — conexão de replicação com o go-mysql, resume da posição salva (ou `SHOW MASTER STATUS` na primeira vez, via `decideStartPosition`), loop de eventos, tratamento de `RotateEvent` e persistência periódica da posição (`BinlogWatcher.persistPosition`, a cada rotação/~5s/encerramento). Todas as mensagens levam o prefixo `[server_id]`.
 - **`config/`** — `ServerConfig` (credenciais + `ReplicaID` do binlog + `BinlogFile`/`BinlogPos`), `InitDB` (cria o schema e migra `servers.db` antigos adicionando `binlog_file`/`binlog_pos` via `ALTER TABLE`, sem perder dados), `LoadServersFromDB`, `UpdateBinlogPosition`, `DefaultServerConfig` (servidor de seed) e `SaveFailedEvent`/`SaveFailedDelivery` (dead-letter dos dois lados). Driver SQLite CGO-free (`modernc.org/sqlite`).
 - **`producer/`** — `Producer` com um registro `map[EventType]EventStrategy`. Adicionar novo tipo de evento = nova estratégia + entrada no mapa, sem tocar no dispatcher. `UpdateRowsStrategy` (update.go) trata UPDATE v1/v2 + compactado MariaDB e reutiliza a base `RowsStrategy` (rows.go): `eachRow` itera os pares old/new, `rowResourceID` extrai o id da coluna 0 (int32/uint32) e `emit` enfileira o evento via `queue.Enqueuer`. **Apenas tabelas com `TableProcessor` registrado geram eventos** — as demais são logadas em Debug.
-- **`pkg/queue/`** — port de fila (Ports & Adapters): `Enqueuer` (Enqueue/Close), envelope `Event` (agora com `ResourceID`) e `MemoryQueue` para testes. `RedisQueue` é o adapter Redis via **asynq**, parametrizado por nome de fila, usando `Event.ID` como `TaskID` para **enqueue idempotente por fila** (`ErrDuplicate`); `RedisWorker`, também parametrizado por fila, é o lado consumer (handler tipado com retry/backoff/DLQ gerenciados pelo asynq). `FanoutQueue` (fanout.go) publica em uma fila por tipo de consumidor; `ShardedQueue` (sharded.go) roteia (não replica) por hash de `tenant:table:resourceID` entre N sub-filas, preservando ordem por recurso quando o consumer daquele shard roda com concorrência 1.
-- **`consumer/webhook/`** — o consumer HTTP: `Delivery` (deliver.go) é o `queue.Handler` que traduz `Event.Table` para o `<tipo>` da rota via `tableToTipo`, faz o `POST` para `srp-hub-api`, e grava em `failed_deliveries` na última tentativa. Não tem estado nem conexão de banco própria — é só um repassador HTTP.
+- **`pkg/queue/`** — port de fila (Ports & Adapters): `Enqueuer` (Enqueue/Close), envelope `Event` (agora com `ResourceID`) e `MemoryQueue` para testes. `RedisQueue` é o adapter Redis via **asynq**, parametrizado por nome de fila, usando `Event.ID` como `TaskID` para **enqueue idempotente por fila** (`ErrDuplicate`); `RedisWorker`, também parametrizado por fila, é o lado consumer (handler tipado com retry/backoff/DLQ gerenciados pelo asynq). `FanoutQueue` (fanout.go) publica em uma fila por tipo de consumidor; `ShardedQueue` (sharded.go) roteia (não replica) por hash de `tenant:table:resourceID` entre N sub-filas, mantendo a ordem por recurso em melhor esforço quando o consumer daquele shard roda com concorrência 1. `Contrato` (contrato.go) é o formato canônico do evento, carregado em `Event.Payload`.
+- **`consumer/webhook/`** — o consumer HTTP: `Delivery` (deliver.go) é o `queue.Handler` — um adapter que traduz o Contrato para o corpo da rota do `srp-hub-api` (`<tipo>` via `rotaPorTipo`), faz o `POST`, e grava em `failed_deliveries` na última tentativa. Não tem estado nem conexão de banco própria — é só um repassador HTTP.
 
 **Evento gerado** (envelope da fila, logado como `evento`):
 
@@ -148,18 +148,23 @@ main.go → config.InitDB() + LoadServersFromDB() → goroutine por servidor
   "tenant": "meu_tenant",
   "table": "pedidos",
   "action": "UPDATE",
-  "timestamp": 1780000000,
   "resource_id": 123,
   "payload": {
+    "idEvento": "evt_ab12cd34...",
+    "tipo": "pedidos",
     "tipoModificacao": "M",
+    "dataEvento": "2026-08-02T01:37:18.912Z",
+    "tenant": "meu_tenant",
     "recurso": { "id": 123, "codigo": "PED-00123", "status": 1, "...": "campos do pedido" }
   }
 }
 ```
 
+O `payload` é o **Contrato canônico** do evento ([ADR 0003](docs/adr/0003-contrato-canonico-do-evento.md)): definido por este projeto, igual para todo Recurso e independente de quem consome — cada tipo de consumidor traduz o Contrato para o formato do seu destino. O evento é um **snapshot** do Recurso ([ADR 0001](docs/adr/0001-eventos-sao-snapshots-entregues-pelo-menos-uma-vez.md)): `dataEvento` é o instante em que o estado foi lido no MariaDB (logo antes do enriquecimento), em ISO-8601 UTC com milissegundos. A entrega é pelo menos uma vez e a ordem por recurso é melhor esforço, então quem consome deve descartar um snapshot com `dataEvento` mais antiga que a do último recebido do mesmo Recurso. O resto do envelope (`table`, `action`, `resource_id`) é interno ao pipeline.
+
 O ID é `evt_` + SHA-256 (16 bytes hex) sobre `binlogFile:logPos:rowIndex:tenant:table:resourceID`. `resource_id` é o mesmo id usado (junto com `tenant`/`table`) para escolher o shard de entrega — repetido no envelope porque `ShardedQueue` não abre o `payload` (que é específico de cada tabela) para descobri-lo.
 
-**O que o consumer HTTP realmente envia** não é esse envelope inteiro — é só o campo `payload` (`{tipoModificacao, recurso}`), como corpo de `POST <SRP_HUB_API_BASE_URL>/interno/hooks/pedidos`, com `Authorization: <SRP_HUB_API_TOKEN>` (valor cru, sem `Bearer`) e `tenant: meu_tenant` nos headers — é exatamente a forma que aquela rota já espera (`src/components/hook/hook.dto.js` do `srp-hub-api`), então o cliente final não vê diferença nenhuma no formato do que recebe.
+**O que o consumer HTTP realmente envia** não é esse envelope nem o Contrato inteiro — é só `{tipoModificacao, recurso}`, como corpo de `POST <SRP_HUB_API_BASE_URL>/interno/hooks/pedidos`, com `Authorization: <SRP_HUB_API_TOKEN>` (valor cru, sem `Bearer`) e `tenant: meu_tenant` nos headers — é exatamente a forma que aquela rota já espera (`src/components/hook/hook.dto.js` do `srp-hub-api`), então o cliente final não vê diferença nenhuma no formato do que recebe. Por decisão, mudanças no Contrato não chegam ao `srp-hub-api`: os clientes atendidos por ele não recebem `dataEvento` por enquanto.
 
 ## Pré-requisitos
 
@@ -347,13 +352,13 @@ Nada em `queue.Event`, nas interfaces `Enqueuer`/`Handler`, em `FanoutQueue`, ou
 
 ## Relação com `srp-hub-api`
 
-O `srp-hub-api` (repositório irmão) já tem a rota `/interno/hooks/pedidos|clientes` que resolve `clientes_hooks`/`cliente` (`hub_<ambiente>`) e faz a entrega final ao cliente. Em vez de duplicar essa resolução aqui (que exigiria ler tabelas de outro projeto), o consumer HTTP deste repositório **repassa** cada evento pra essa rota — decisão tomada depois de comparar os dois sistemas e confirmar (no código-fonte de lá) que o payload que ela espera (`{tipoModificacao, recurso}`) é exatamente o que já temos em `Event.Payload`, sem precisar reformatar nada.
+O `srp-hub-api` (repositório irmão) já tem a rota `/interno/hooks/pedidos|clientes` que resolve `clientes_hooks`/`cliente` (`hub_<ambiente>`) e faz a entrega final ao cliente. Em vez de duplicar essa resolução aqui (que exigiria ler tabelas de outro projeto), o consumer HTTP deste repositório **repassa** cada evento pra essa rota — decisão tomada depois de comparar os dois sistemas e confirmar (no código-fonte de lá) que o payload que ela espera (`{tipoModificacao, recurso}`) sai direto do Contrato canônico, sem precisar de nenhum dado extra.
 
 **Como funciona a chamada:**
-- `POST <SRP_HUB_API_BASE_URL>/interno/hooks/<tipo>` — `<tipo>` vem de `tableToTipo` (hoje só `pedidos`).
+- `POST <SRP_HUB_API_BASE_URL>/interno/hooks/<tipo>` — `<tipo>` vem do `tipo` do Contrato via `rotaPorTipo` (hoje só `pedidos`).
 - Header `Authorization: <SRP_HUB_API_TOKEN>` — valor **cru**, sem prefixo `Bearer`; comparado literalmente contra a coluna `token` (descriptografada) de uma linha em `cliente_hub_autenticacao`, no banco do `srp-hub-api`.
 - Header `tenant: <tenant>` — o nome do tenant (schema), igual ao que já usamos em `Event.Tenant`.
-- Corpo: `Event.Payload` como está, sem reformatar.
+- Corpo: `{tipoModificacao, recurso}`, traduzido do Contrato em `Event.Payload` (sem `idEvento`, `dataEvento`, `tipo` nem `tenant` — exatamente o que a rota recebia antes do Contrato). Um evento enfileirado antes do Contrato (sem `tipo`) é roteado por `Event.Table` e logado em Warn, em vez de descartado.
 
 **Estado atual (projeto ainda em desenvolvimento):**
 

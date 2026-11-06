@@ -46,15 +46,15 @@ func QueueNameHTTPShard(shard int) string {
 	return fmt.Sprintf("%s.%d", QueueNameHTTP, shard)
 }
 
-// Event é o envelope transportado pela fila. Os campos de metadados são comuns
-// a todo evento de webhook; Payload carrega o recurso enriquecido (ex:
-// PedidoEvent do tables/) já serializado em JSON.
+// Event é o envelope interno transportado pela fila. Os campos de metadados
+// servem ao pipeline (idempotência, sharding, dead-letter); Payload carrega o
+// Contrato canônico (contrato.go) já serializado em JSON — é ele, e não o
+// envelope, que sai para os destinos.
 type Event struct {
 	ID         string          `json:"id"`
 	Tenant     string          `json:"tenant"`
 	Table      string          `json:"table"`
 	Action     Action          `json:"action"`
-	Timestamp  int64           `json:"timestamp"`
 	ResourceID int             `json:"resource_id,omitempty"`
 	Payload    json.RawMessage `json:"payload,omitempty"`
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
 
@@ -31,6 +32,7 @@ type EventStrategy interface {
 // os eventos gerados na fila via Enqueuer.
 type Producer struct {
 	strategies map[replication.EventType]EventStrategy
+	update     *UpdateRowsStrategy
 	log        *slog.Logger
 	db         *sql.DB
 	enqueuer   queue.Enqueuer
@@ -45,6 +47,7 @@ func NewProducer(logger *slog.Logger, mariaDB *sql.DB, sqliteDB *sql.DB, serverI
 			serverID:   serverID,
 			enqueuer:   enqueuer,
 			processors: defaultProcessors(),
+			now:        time.Now,
 		},
 	}
 	return &Producer{
@@ -53,6 +56,7 @@ func NewProducer(logger *slog.Logger, mariaDB *sql.DB, sqliteDB *sql.DB, serverI
 			replication.UPDATE_ROWS_EVENTv2:                     update,
 			replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1: update,
 		},
+		update:   update,
 		log:      logger,
 		db:       mariaDB,
 		enqueuer: enqueuer,

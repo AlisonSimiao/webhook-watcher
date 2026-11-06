@@ -16,6 +16,10 @@ func (p *PedidoProcessor) Supports(tableName string) bool {
 	return strings.ToLower(tableName) == "pedidos"
 }
 
+func (p *PedidoProcessor) Tipo() string {
+	return "pedidos"
+}
+
 func (p *PedidoProcessor) Process(ctx *tables.TableContext) (interface{}, error) {
 	recurso := parsePedidoRecursoFromRow(ctx.NewRow)
 
@@ -24,19 +28,7 @@ func (p *PedidoProcessor) Process(ctx *tables.TableContext) (interface{}, error)
 		enricher.Enrich(&recurso)
 	}
 
-	tipoMod := TipoModificacaoModificado
-	if ctx.Action == "INSERT" {
-		tipoMod = TipoModificacaoCriado
-	} else if ctx.Action == "DELETE" {
-		tipoMod = TipoModificacaoDeletado
-	}
-
-	event := PedidoEvent{
-		TipoModificacao: tipoMod,
-		Recurso:         recurso,
-	}
-
-	return event, nil
+	return recurso, nil
 }
 
 func parsePedidoRecursoFromRow(row []interface{}) PedidoRecurso {
