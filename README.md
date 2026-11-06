@@ -283,6 +283,23 @@ docker run -d --name watcher  --env-file .env -v watcher-data:/data webhook-watc
 docker run -d --name consumer --env-file .env -v watcher-data:/data webhook-watcher consumer http
 ```
 
+### Staging (`docker-compose.staging.yaml`)
+
+Sobe tudo numa máquina com Docker — Redis, watcher (producer), consumer e asynqmon — com volume compartilhado em `/data`, `restart: unless-stopped` e healthcheck no `/healthz` de cada processo:
+
+```bash
+cp .env.example .env.staging   # preencha DB_*, REPLICA_ID, SRP_HUB_API_*  (gitignored)
+docker compose -f docker-compose.staging.yaml up -d --build
+docker compose -f docker-compose.staging.yaml ps            # watcher/consumer devem ficar (healthy)
+```
+
+- Watcher e consumer leem o **mesmo** `.env.staging`, então `HTTP_CONSUMER_SHARDS` não diverge. `REDIS_ADDR` é fixado pelo compose (`redis:6379`).
+- O servidor MariaDB é semeado de `DB_*` só na primeira subida; depois, use `server update`:
+  `docker compose -f docker-compose.staging.yaml exec watcher ./webhook-watcher server list`
+- Dead-letters: `... exec consumer ./webhook-watcher failed-deliveries list` (o arquivo é o mesmo nos dois containers).
+- asynqmon (`:8080`) e `/healthz` (`:8090` watcher, `:8091` consumer) ficam só em `127.0.0.1` — numa máquina remota, use túnel SSH.
+- `DB_HOST` precisa resolver e ser alcançável **de dentro do container** (ex: `db.1.stag.mp.private` só resolve dentro da VPC).
+
 ## Estrutura do projeto
 
 ```
@@ -290,7 +307,8 @@ docker run -d --name consumer --env-file .env -v watcher-data:/data webhook-watc
 ├── .env.example            # variáveis do servidor padrão + HTTP_CONSUMER_SHARDS + SRP_HUB_API_* (copie para .env)
 ├── binlog.go               # watcher de binlog (package main)
 ├── binlog_test.go          # testes de decideStartPosition (resume vs. 1ª execução)
-├── docker-compose.yaml     # Redis + asynqmon (infra local de dev)
+├── docker-compose.yaml     # Redis + asynqmon (infra local de dev; profile dump: srp-hub-api falso)
+├── docker-compose.staging.yaml # deploy de staging: redis + watcher + consumer + asynqmon
 ├── health.go               # /healthz (liveness dos watchers / shards do consumer)
 ├── logging.go              # dropMessageHandler (filtra logs não serializáveis)
 ├── main.go                 # entrypoint (package main), initQueue() monta FanoutQueue+ShardedQueue

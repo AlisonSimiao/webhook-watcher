@@ -1,4 +1,5 @@
 .env
+.env.staging
 *.db
 *.db-wal
 *.db-shm
