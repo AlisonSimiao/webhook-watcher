@@ -1,2 +1,2 @@
 .env
-servers.db
+*.db

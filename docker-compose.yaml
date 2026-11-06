@@ -3,6 +3,10 @@
 # Subir apenas Redis: docker compose up -d redis
 # Painel asynqmon: http://localhost:8080
 # (o MariaDB é externo e configurado no .env / binlog_servers)
+#
+# Teste local sem o srp-hub-api: docker compose --profile dump up -d sobe
+# também um receptor HTTP falso no lugar dele na porta 8090 (os corpos
+# recebidos aparecem em: docker compose logs -f hub-api-fake).
 services:
   redis:
     image: redis:7-alpine
@@ -29,6 +33,16 @@ services:
     ports:
       - "8080:8080"
     command: ["--redis-addr=redis:6379"]
+
+  # Substitui o srp-hub-api no teste local: responde 200 a qualquer requisição
+  # e loga método, path, headers (Authorization/tenant) e corpo.
+  hub-api-fake:
+    image: mendhak/http-https-echo:34
+    container_name: webhook-watcher-hub-api-fake
+    profiles: ["dump"]
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
 
 volumes:
   redis-data:
