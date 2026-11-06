@@ -5,7 +5,7 @@ Captura mudanças nas tabelas do ERP (via binlog do MariaDB) e as publica como e
 ## Language
 
 **Evento**:
-Um snapshot do estado atual de um Recurso, emitido porque o Recurso mudou. Um Evento mais novo do mesmo Recurso substitui o anterior; não é um fato de negócio isolado ("PedidoFaturado") nem fonte da verdade.
+Um snapshot do estado de um Recurso no momento da mudança, emitido porque o Recurso mudou; num Evento `D`, é o último estado conhecido antes da remoção. Um Evento mais novo do mesmo Recurso substitui o anterior; não é um fato de negócio isolado ("PedidoFaturado") nem fonte da verdade. O snapshot pode estar incompleto (ex: pedido criado antes de ter itens) — o Evento seguinte do Recurso o completa.
 _Avoid_: mensagem, task, hook, evento de domínio
 
 **Data do evento** (`dataEvento`):
@@ -17,7 +17,7 @@ A entidade de negócio de um tenant que um Evento descreve por completo (hoje, o
 _Avoid_: registro, linha, row
 
 **Tipo de modificação**:
-Classificação da mudança que originou o Evento: `C` (criado), `M` (modificado) ou `D` (deletado).
+Classificação da mudança que originou o Evento: `C` (criado), `M` (modificado) ou `D` (deletado). `D` é só a remoção física do Recurso; uma remoção lógica (status de cancelado/excluído) é `M`. `D` é terminal: um Evento mais antigo do mesmo Recurso que chegue depois dele não o recria.
 _Avoid_: action, operação
 
 **Tenant**:

@@ -203,3 +203,137 @@ func TestGenerateEventIDDeterministic(t *testing.T) {
 		t.Errorf("IDs distintos deveriam diferir para resource_id diferentes")
 	}
 }
+
+func binlogRowsEvent(eventType replication.EventType, schema, table string, rows [][]interface{}) *replication.BinlogEvent {
+	ev := binlogUpdateEvent(schema, table, rows)
+	ev.Header.EventType = eventType
+	return ev
+}
+
+// contratoDe decodifica o Contrato e o PedidoRecurso de um evento enfileirado.
+func contratoDe(t *testing.T, event *queue.Event) (queue.Contrato, pedido.PedidoRecurso) {
+	t.Helper()
+	var contrato queue.Contrato
+	if err := json.Unmarshal(event.Payload, &contrato); err != nil {
+		t.Fatalf("payload não é um Contrato válido: %v", err)
+	}
+	var recurso pedido.PedidoRecurso
+	if err := json.Unmarshal(contrato.Recurso, &recurso); err != nil {
+		t.Fatalf("recurso não é um PedidoRecurso válido: %v", err)
+	}
+	return contrato, recurso
+}
+
+func TestInsertStrategyEmitsCriadoPerRow(t *testing.T) {
+	for _, tipo := range []replication.EventType{
+		replication.WRITE_ROWS_EVENTv1,
+		replication.WRITE_ROWS_EVENTv2,
+		replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1,
+	} {
+		t.Run(tipo.String(), func(t *testing.T) {
+			mem := queue.NewMemoryQueue()
+			prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
+
+			outro := pedidoRow()
+			outro[0] = int32(43)
+			// INSERT chega em linhas únicas (stride 1): duas linhas = dois pedidos.
+			if err := prod.HandleEvent("mysql-bin.000001", 123, binlogRowsEvent(tipo, "meu_tenant", "pedidos", [][]interface{}{
+				pedidoRow(),
+				outro,
+			})); err != nil {
+				t.Fatalf("HandleEvent retornou erro: %v", err)
+			}
+
+			pending := mem.Pending()
+			if len(pending) != 2 {
+				t.Fatalf("esperava 2 eventos na fila, obteve %d", len(pending))
+			}
+			for i, wantID := range []int{42, 43} {
+				event := pending[i]
+				if event.Action != queue.ActionInsert {
+					t.Errorf("Action inesperado: %s", event.Action)
+				}
+				if event.ResourceID != wantID {
+					t.Errorf("ResourceID inesperado: %d (esperava %d)", event.ResourceID, wantID)
+				}
+				contrato, recurso := contratoDe(t, event)
+				if contrato.TipoModificacao != queue.TipoModificacaoCriado {
+					t.Errorf("TipoModificacao inesperado: %s", contrato.TipoModificacao)
+				}
+				if recurso.ID != wantID {
+					t.Errorf("Recurso.ID inesperado: %d (esperava %d)", recurso.ID, wantID)
+				}
+			}
+			if pending[0].ID == pending[1].ID {
+				t.Errorf("linhas distintas do mesmo evento deveriam ter IDs distintos")
+			}
+		})
+	}
+}
+
+func TestDeleteStrategyEmitsDeletadoFromDeletedRow(t *testing.T) {
+	for _, tipo := range []replication.EventType{
+		replication.DELETE_ROWS_EVENTv1,
+		replication.DELETE_ROWS_EVENTv2,
+		replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1,
+	} {
+		t.Run(tipo.String(), func(t *testing.T) {
+			mem := queue.NewMemoryQueue()
+			prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
+
+			if err := prod.HandleEvent("mysql-bin.000001", 123, binlogRowsEvent(tipo, "meu_tenant", "pedidos", [][]interface{}{
+				pedidoRow(),
+			})); err != nil {
+				t.Fatalf("HandleEvent retornou erro: %v", err)
+			}
+
+			pending := mem.Pending()
+			if len(pending) != 1 {
+				t.Fatalf("esperava 1 evento na fila, obteve %d", len(pending))
+			}
+			if pending[0].Action != queue.ActionDelete {
+				t.Errorf("Action inesperado: %s", pending[0].Action)
+			}
+			contrato, recurso := contratoDe(t, pending[0])
+			if contrato.TipoModificacao != queue.TipoModificacaoDeletado {
+				t.Errorf("TipoModificacao inesperado: %s", contrato.TipoModificacao)
+			}
+			// O recurso de um D é a capa como estava na linha deletada.
+			if recurso.ID != 42 || recurso.Codigo != "PED-00042" {
+				t.Errorf("Recurso inesperado: id=%d codigo=%s", recurso.ID, recurso.Codigo)
+			}
+		})
+	}
+}
+
+func TestDeleteStrategyPassesDeletedRowAsOldRow(t *testing.T) {
+	mem := queue.NewMemoryQueue()
+	prod := NewProducer(testLogger(), nil, nil, "test-server", mem)
+	espiao := &processorContexto{}
+	prod.update.processors = []tables.TableProcessor{espiao}
+
+	if err := prod.HandleEvent("mysql-bin.000001", 123, binlogRowsEvent(replication.DELETE_ROWS_EVENTv2, "meu_tenant", "pedidos", [][]interface{}{
+		pedidoRow(),
+	})); err != nil {
+		t.Fatalf("HandleEvent retornou erro: %v", err)
+	}
+	if espiao.ctx == nil {
+		t.Fatalf("Process não foi chamado")
+	}
+	if espiao.ctx.Action != string(queue.ActionDelete) {
+		t.Errorf("Action inesperado: %s", espiao.ctx.Action)
+	}
+	if espiao.ctx.NewRow != nil || len(espiao.ctx.OldRow) == 0 {
+		t.Errorf("no DELETE a linha deletada vai em OldRow e NewRow é nil; NewRow=%v OldRow=%v", espiao.ctx.NewRow, espiao.ctx.OldRow)
+	}
+}
+
+// processorContexto guarda o TableContext recebido em Process.
+type processorContexto struct{ ctx *tables.TableContext }
+
+func (p *processorContexto) Supports(string) bool { return true }
+func (p *processorContexto) Tipo() string         { return "pedidos" }
+func (p *processorContexto) Process(ctx *tables.TableContext) (interface{}, error) {
+	p.ctx = ctx
+	return map[string]int{"id": 42}, nil
+}

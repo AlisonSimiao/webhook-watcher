@@ -21,6 +21,13 @@ func (p *PedidoProcessor) Tipo() string {
 }
 
 func (p *PedidoProcessor) Process(ctx *tables.TableContext) (interface{}, error) {
+	// No DELETE a linha já não existe no MariaDB: o Recurso é a capa como estava
+	// na linha deletada, sem enriquecimento (endereço, itens etc. já foram
+	// removidos ou não são mais confiáveis).
+	if ctx.Action == "DELETE" {
+		return parsePedidoRecursoFromRow(ctx.OldRow), nil
+	}
+
 	recurso := parsePedidoRecursoFromRow(ctx.NewRow)
 
 	if ctx.DB != nil {

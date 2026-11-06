@@ -3,7 +3,10 @@ package producer
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -53,6 +56,81 @@ func (r *RowsStrategy) eachRow(ctx *EventContext, stride, newOffset int, visit f
 		}
 	}
 	return nil
+}
+
+// emitRows monta e enfileira um Evento por linha do RowsEvent, com o
+// tipoModificacao derivado da ação. Na DELETE a linha visitada é a deletada e
+// vai ao TableProcessor como OldRow; nas demais, é a linha nova (NewRow).
+func (r *RowsStrategy) emitRows(ctx *EventContext, action queue.Action, stride, newOffset int) error {
+	return r.eachRow(ctx, stride, newOffset, func(rowIndex int, row []interface{}) error {
+		rowsEvent := ctx.Event.Event.(*replication.RowsEvent)
+		schema := string(rowsEvent.Table.Schema)
+		tableName := strings.ToLower(string(rowsEvent.Table.Table))
+
+		resourceID, ok := rowResourceID(row)
+		if !ok {
+			tipo := "linha vazia"
+			if len(row) > 0 {
+				tipo = fmt.Sprintf("%T", row[0])
+			}
+			r.log.Warn("Coluna 0 não é INT assinado; evento ignorado",
+				"tenant", schema,
+				"table", tableName,
+				"tipo", tipo)
+			return nil
+		}
+
+		newRow, oldRow := row, []interface{}(nil)
+		if action == queue.ActionDelete {
+			newRow, oldRow = nil, row
+		}
+
+		// A dataEvento é lida antes do Process, que é quem lê o estado do
+		// Recurso no MariaDB (enriquecimento): o snapshot é no máximo tão novo
+		// quanto ela, nunca mais antigo.
+		dataEvento := r.dataEvento()
+
+		// Apenas tabelas com TableProcessor registrado geram eventos.
+		tipo, recurso, handled, err := r.dispatchTable(schema, tableName, string(action), newRow, oldRow)
+		if err != nil {
+			r.log.Error("Erro ao processar tabela com TableProcessor", "tabela", tableName, "error", err)
+			return err
+		}
+		if !handled {
+			r.log.Debug("Tabela sem TableProcessor; nenhum evento emitido", "tabela", tableName)
+			return nil
+		}
+
+		recursoJSON, err := json.Marshal(recurso)
+		if err != nil {
+			r.log.Error("Erro ao serializar recurso do evento", "tabela", tableName, "error", err)
+			return err
+		}
+
+		id := generateEventID(ctx.BinlogFile, ctx.BinlogPos, rowIndex, schema, tableName, resourceID)
+		payload, err := json.Marshal(queue.Contrato{
+			IDEvento:        id,
+			Tipo:            tipo,
+			TipoModificacao: queue.TipoModificacaoDe(action),
+			DataEvento:      dataEvento,
+			Tenant:          schema,
+			Recurso:         recursoJSON,
+		})
+		if err != nil {
+			r.log.Error("Erro ao serializar payload do evento", "tabela", tableName, "error", err)
+			return err
+		}
+
+		r.emit(ctx.Ctx, &queue.Event{
+			ID:         id,
+			Tenant:     schema,
+			Table:      tableName,
+			Action:     action,
+			ResourceID: resourceID,
+			Payload:    payload,
+		})
+		return nil
+	})
 }
 
 // rowResourceID extrai o ID do recurso da coluna 0 da linha (int32 ou uint32,

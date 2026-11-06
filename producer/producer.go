@@ -39,22 +39,31 @@ type Producer struct {
 }
 
 func NewProducer(logger *slog.Logger, mariaDB *sql.DB, sqliteDB *sql.DB, serverID string, enqueuer queue.Enqueuer) *Producer {
-	update := &UpdateRowsStrategy{
-		RowsStrategy: RowsStrategy{
-			log:        logger,
-			db:         mariaDB,
-			sqliteDB:   sqliteDB,
-			serverID:   serverID,
-			enqueuer:   enqueuer,
-			processors: defaultProcessors(),
-			now:        time.Now,
-		},
+	// As estratégias de ROWS compartilham o mesmo RowsStrategy (processors,
+	// relógio, enqueuer).
+	rows := &RowsStrategy{
+		log:        logger,
+		db:         mariaDB,
+		sqliteDB:   sqliteDB,
+		serverID:   serverID,
+		enqueuer:   enqueuer,
+		processors: defaultProcessors(),
+		now:        time.Now,
 	}
+	insert := &InsertRowsStrategy{RowsStrategy: rows}
+	update := &UpdateRowsStrategy{RowsStrategy: rows}
+	del := &DeleteRowsStrategy{RowsStrategy: rows}
 	return &Producer{
 		strategies: map[replication.EventType]EventStrategy{
+			replication.WRITE_ROWS_EVENTv1:                      insert,
+			replication.WRITE_ROWS_EVENTv2:                      insert,
+			replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:  insert,
 			replication.UPDATE_ROWS_EVENTv1:                     update,
 			replication.UPDATE_ROWS_EVENTv2:                     update,
 			replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1: update,
+			replication.DELETE_ROWS_EVENTv1:                     del,
+			replication.DELETE_ROWS_EVENTv2:                     del,
+			replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1: del,
 		},
 		update:   update,
 		log:      logger,

@@ -200,3 +200,44 @@ func TestIsLastAttempt_PlainContextReturnsFalse(t *testing.T) {
 		t.Fatal("esperava false para um context.Context sem metadados de task do asynq")
 	}
 }
+
+// O srp-hub-api só aceita C/M para pedidos (hook.validator.js): um D de pedido
+// é no-op aqui, não erro — senão esgotaria os retries e iria para
+// failed_deliveries a cada pedido deletado.
+func TestDelivery_Handle_PedidoDeletadoIsNoop(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+	}))
+	defer srv.Close()
+
+	d := NewDelivery(srv.URL, "token", nil, testLogger())
+
+	payload := []byte(`{"idEvento":"evt_1","tipo":"pedidos","tipoModificacao":"D","dataEvento":"2026-11-06T14:03:12.457Z","tenant":"acme","recurso":{"id":42}}`)
+	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos", Action: queue.ActionDelete, Payload: payload}
+	if err := d.Handle(context.Background(), event); err != nil {
+		t.Fatalf("esperava nil, obteve %v", err)
+	}
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("esperava nenhuma chamada HTTP, obteve %d", calls)
+	}
+}
+
+func TestDelivery_Handle_PedidoCriadoIsDelivered(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+	}))
+	defer srv.Close()
+
+	d := NewDelivery(srv.URL, "token", nil, testLogger())
+
+	payload := []byte(`{"idEvento":"evt_1","tipo":"pedidos","tipoModificacao":"C","dataEvento":"2026-11-06T14:03:12.457Z","tenant":"acme","recurso":{"id":42}}`)
+	event := &queue.Event{ID: "evt_1", Tenant: "acme", Table: "pedidos", Action: queue.ActionInsert, Payload: payload}
+	if err := d.Handle(context.Background(), event); err != nil {
+		t.Fatalf("esperava nil, obteve %v", err)
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Fatalf("esperava 1 chamada HTTP, obteve %d", calls)
+	}
+}

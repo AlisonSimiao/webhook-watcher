@@ -29,6 +29,15 @@ var rotaPorTipo = map[string]string{
 	"pedidos": "pedidos",
 }
 
+// modificacoesSemRota lista, por tipo de Recurso, os tipos de modificação que
+// a rota de hooks do srp-hub-api recusa (hook.validator.js: pedidos só aceita
+// C/M — WEBHOOK.TIPO_MODIFICACAO.PEDIDO). O Evento existe no Contrato, mas
+// para este consumer é no-op, não erro: enviá-lo só esgotaria os retries e
+// encheria failed_deliveries. Remover a entrada quando o srp-hub-api aceitar.
+var modificacoesSemRota = map[string]map[queue.TipoModificacao]bool{
+	"pedidos": {queue.TipoModificacaoDeletado: true},
+}
+
 // Delivery entrega eventos repassando para o srp-hub-api (POST
 // <baseURL>/interno/hooks/<tipo>), que já resolve os destinos de webhook por
 // cliente (clientes_hooks/cliente) e faz o fan-out — este consumer não lê
@@ -93,6 +102,10 @@ func (d *Delivery) Handle(ctx context.Context, event *queue.Event) error {
 	tipo, ok := rotaPorTipo[contrato.Tipo]
 	if !ok {
 		d.log.Debug("Tipo de Recurso sem rota de hook conhecida; ignorando", "tipo", contrato.Tipo)
+		return nil
+	}
+	if modificacoesSemRota[contrato.Tipo][contrato.TipoModificacao] {
+		d.log.Debug("Tipo de modificação não aceito pela rota de hook; ignorando", "tipo", contrato.Tipo, "tipo_modificacao", contrato.TipoModificacao, "event_id", event.ID)
 		return nil
 	}
 
