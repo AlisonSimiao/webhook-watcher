@@ -2,7 +2,9 @@ package config
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -178,5 +180,77 @@ func TestSaveFailedDelivery_PersistsAndIsQueryable(t *testing.T) {
 	}
 	if errMsg != "resposta não-2xx: 500" {
 		t.Fatalf("mensagem de erro persistida incorreta: %s", errMsg)
+	}
+}
+
+// Producer e consumer rodam em processos separados apontando para o mesmo
+// servers.db; cada InitDB abaixo simula um deles. Sem busy_timeout, escritas
+// simultâneas falham com SQLITE_BUSY ("database is locked").
+func TestInitDB_ConcurrentWritersOnSameFile(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "servers.db")
+
+	producerDB, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("InitDB (producer) falhou: %v", err)
+	}
+	defer producerDB.Close()
+	consumerDB, err := InitDB(dbPath)
+	if err != nil {
+		t.Fatalf("InitDB (consumer) falhou: %v", err)
+	}
+	defer consumerDB.Close()
+
+	if _, err := producerDB.Exec(`INSERT INTO binlog_servers (server_id, replica_id, host, user, password) VALUES ('DB01', 100, 'localhost', 'root', 'senha')`); err != nil {
+		t.Fatalf("erro ao inserir servidor: %v", err)
+	}
+
+	const writes = 200
+	errs := make(chan error, 3*writes)
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes; i++ {
+			errs <- UpdateBinlogPosition(producerDB, "DB01", "mariadb-bin.000001", uint32(i))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes; i++ {
+			errs <- SaveFailedEvent(producerDB, "DB01", fmt.Sprintf("evt_p%d", i), "t", "pedidos", "UPDATE", []byte(`{}`), "erro")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < writes; i++ {
+			errs <- SaveFailedDelivery(consumerDB, fmt.Sprintf("evt_c%d", i), "t", "pedidos", "UPDATE", "http://x", []byte(`{}`), "erro")
+		}
+	}()
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("escrita concorrente falhou: %v", err)
+		}
+	}
+
+	var events, deliveries int
+	if err := consumerDB.QueryRow(`SELECT COUNT(*) FROM failed_events`).Scan(&events); err != nil {
+		t.Fatalf("erro ao contar failed_events: %v", err)
+	}
+	if err := producerDB.QueryRow(`SELECT COUNT(*) FROM failed_deliveries`).Scan(&deliveries); err != nil {
+		t.Fatalf("erro ao contar failed_deliveries: %v", err)
+	}
+	if events != writes || deliveries != writes {
+		t.Fatalf("esperava %d linhas em cada tabela, obteve failed_events=%d failed_deliveries=%d", writes, events, deliveries)
+	}
+
+	var mode string
+	if err := producerDB.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatalf("erro ao ler journal_mode: %v", err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal_mode = %q, esperava wal", mode)
 	}
 }

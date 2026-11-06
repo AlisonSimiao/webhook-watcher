@@ -55,9 +55,15 @@ func GetEnv(key, fallback string) string {
 	return fallback
 }
 
+// sqlitePragmas é aplicado em toda conexão aberta: producer e consumer
+// escrevem no mesmo servers.db em processos separados. busy_timeout faz uma
+// escrita esperar (até 5s) o lock da outra em vez de falhar na hora com
+// SQLITE_BUSY; WAL deixa leituras e escrita rodarem em paralelo.
+const sqlitePragmas = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+
 // InitDB abre/cria o banco SQLite e garante o esquema de binlog_servers.
 func InitDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", dbPath+sqlitePragmas)
 	if err != nil {
 		return nil, fmt.Errorf("erro ao abrir banco SQLite %s: %w", dbPath, err)
 	}
